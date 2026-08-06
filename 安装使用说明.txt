@@ -8,12 +8,13 @@
 3. 重新启动工具，在图像生成插件列表中打开“鸭梨AI图像生成插件（低价版）”。
 
 二、首次配置
-1. 分别填写 GPT-image-2 API Key 和 Gemini API Key。
-2. API 地址固定为 https://api.yaliai.com/，插件界面不允许修改。
-3. “模型”选择决定使用的接口类型：
+1. 点击插件底部的“设置”打开配置窗口。
+2. 分别填写 GPT-image-2 API Key 和 Gemini API Key。
+3. API URL 默认是 https://api.yaliai.com，可按实际网关地址修改并保存。
+4. “模型”选择决定使用的接口类型：
    - gpt-image-2：OpenAI Images 接口。
    - gemini-3.1-flash-image-preview、gemini-3-pro-image-preview：Gemini 接口。
-4. 保存后即可在工具的图像生成界面调用。
+5. 关闭设置窗口后即可在工具的图像生成界面调用。
 
 三、生成模式
 1. 默认（单模型）：只调用当前选择的模型。

@@ -10,6 +10,7 @@
     .api-key-wrapper input { flex: 1; padding-right: 36px; }
     .toggle-eye { position: absolute; right: 8px; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; padding: 2px 4px; }
     .task-log { margin-top: 14px; }
+    .plugin-actions { display: flex; gap: 8px; margin-top: 14px; }
     .upscale-prompt { min-height: 120px; resize: vertical; font-family: inherit; }
     .mode-options { display: flex; gap: 6px; }
     .mode-btn {
@@ -26,31 +27,14 @@
     }
     .mode-btn:hover { border-color: #5a5d70; color: var(--text-primary); }
     .mode-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .settings-backdrop { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0, 0, 0, 0.45); }
+    .settings-dialog { width: min(100%, 480px); max-height: calc(100vh - 32px); overflow: auto; padding: 16px; background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: var(--radius); }
+    .settings-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .settings-header h3 { margin: 0; }
   </style>
 </head>
 <body>
   <h3>鸭梨AI图像生成插件(低价版)</h3>
-
-  <div class="form-row">
-    <label class="form-label">GPT-image-2 API Key</label>
-    <div class="form-control"><div class="api-key-wrapper">
-      <input type="password" id="gptApiKeyInput" placeholder="请输入 GPT-image-2 租户 API Key">
-      <button class="toggle-eye" type="button" data-target="gptApiKeyInput" aria-label="显示或隐藏 GPT-image-2 API Key">显示</button>
-    </div></div>
-  </div>
-
-  <div class="form-row">
-    <label class="form-label">Gemini API Key</label>
-    <div class="form-control"><div class="api-key-wrapper">
-      <input type="password" id="geminiApiKeyInput" placeholder="请输入 Gemini 租户 API Key">
-      <button class="toggle-eye" type="button" data-target="geminiApiKeyInput" aria-label="显示或隐藏 Gemini API Key">显示</button>
-    </div></div>
-  </div>
-
-  <div class="form-row">
-    <label class="form-label">API URL</label>
-    <div class="form-control"><input type="text" value="https://api.yaliai.com/" readonly aria-readonly="true"></div>
-  </div>
 
   <div class="form-row">
     <label class="form-label">生成模式</label>
@@ -120,12 +104,41 @@
     </select></div>
   </div>
 
-  <div class="task-log">
+  <div class="plugin-actions">
     <button id="openTaskLog" type="button">打开任务日志</button>
+    <button id="openSettings" type="button">设置</button>
+  </div>
+
+  <div class="settings-backdrop" id="settingsPanel" hidden>
+    <section class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="settings-header">
+        <h3 id="settingsTitle">设置</h3>
+        <button id="closeSettings" type="button">关闭</button>
+      </div>
+      <div class="form-row">
+        <label class="form-label">API URL</label>
+        <div class="form-control"><input type="url" id="endpointInput" placeholder="https://api.yaliai.com"></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">GPT-image-2 API Key</label>
+        <div class="form-control"><div class="api-key-wrapper">
+          <input type="password" id="gptApiKeyInput" placeholder="请输入 GPT-image-2 租户 API Key">
+          <button class="toggle-eye" type="button" data-target="gptApiKeyInput" aria-label="显示或隐藏 GPT-image-2 API Key">显示</button>
+        </div></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Gemini API Key</label>
+        <div class="form-control"><div class="api-key-wrapper">
+          <input type="password" id="geminiApiKeyInput" placeholder="请输入 Gemini 租户 API Key">
+          <button class="toggle-eye" type="button" data-target="geminiApiKeyInput" aria-label="显示或隐藏 Gemini API Key">显示</button>
+        </div></div>
+      </div>
+    </section>
   </div>
 
   <script>
     var defaults = {
+      endpoint: 'https://api.yaliai.com',
       model: 'gemini-3.1-flash-image-preview',
       aspect_ratio: '16:9',
       image_size: '4K',
@@ -135,6 +148,7 @@
       upscale_prompt: '现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。请将图像精细度和文字边缘细节提升至 {{image_size}} 电影级分辨率。场景清晰不允许存在锯齿和噪点，颜色纯净。请在画面中原地追加细节。保持图像 {{aspect_ratio}} 比例，不要因为限制图像比例而使用变形的素材和文字。图像比例不对将判定为任务失败！'
     }
     var fields = {
+      endpoint: document.getElementById('endpointInput'),
       gpt_api_key: document.getElementById('gptApiKeyInput'),
       gemini_api_key: document.getElementById('geminiApiKeyInput'),
       model: document.getElementById('modelSelect'),
@@ -146,6 +160,7 @@
     }
     var modeButtons = document.querySelectorAll('.mode-btn')
     var currentGenerationMode = 'default'
+    var settingsPanel = document.getElementById('settingsPanel')
     var sdkReady = false
 
     function updateUpscaleVisibility() {
@@ -216,6 +231,19 @@
     Object.keys(fields).forEach(function (key) { fields[key].addEventListener('change', function () { save(key) }) })
     modeButtons.forEach(function (button) {
       button.addEventListener('click', function () { setGenerationMode(button.dataset.mode, true) })
+    })
+    document.getElementById('openSettings').addEventListener('click', function () {
+      settingsPanel.hidden = false
+      fields.endpoint.focus()
+    })
+    document.getElementById('closeSettings').addEventListener('click', function () {
+      settingsPanel.hidden = true
+    })
+    settingsPanel.addEventListener('click', function (event) {
+      if (event.target === settingsPanel) settingsPanel.hidden = true
+    })
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape' && !settingsPanel.hidden) settingsPanel.hidden = true
     })
     PluginSDK.onAction('load_params', function (result) { if (result && result.ok) applyParams(result.params) })
     document.getElementById('openTaskLog').addEventListener('click', function () {

@@ -116,19 +116,22 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(plugin._api_key_for_model(params, "gpt-image-2"), "gpt-key")
         self.assertEqual(plugin._api_key_for_model(params, "gemini-3.1-flash-image-preview"), "gemini-key")
 
-    def test_generation_uses_the_locked_yaliai_gateway(self):
+    def test_generation_uses_the_configured_gateway_endpoint(self):
         with tempfile.TemporaryDirectory() as output_dir, \
                 patch.object(plugin, "send_gemini_request", return_value=[{"type": "b64", "value": PNG_1X1}]) as submit:
             plugin.generate({
-                "prompt": "locked endpoint test",
+                "prompt": "configured endpoint test",
                 "output_dir": output_dir,
                 "plugin_params": {
                     "gemini_api_key": "test-key",
-                    "endpoint": "https://untrusted.example.test",
+                    "endpoint": "https://gateway.example.test/",
                     "model": "gemini-3.1-flash-image-preview",
                 },
             })
-        self.assertEqual(submit.call_args.kwargs["endpoint"], "https://api.yaliai.com")
+        self.assertEqual(submit.call_args.kwargs["endpoint"], "https://gateway.example.test")
+        self.assertEqual(plugin._normalize_endpoint(None), "https://api.yaliai.com")
+        with self.assertRaisesRegex(Exception, "API URL"):
+            plugin._normalize_endpoint("ftp://gateway.example.test")
 
     def test_upscale_mode_runs_source_then_upscale_and_returns_only_final_file(self):
         stage_order = []
@@ -326,12 +329,15 @@ class PluginContractTests(unittest.TestCase):
             self.assertTrue(cleared["ok"])
             self.assertEqual(plugin.handle_action("get_task_logs")["total"], 0)
 
-    def test_ui_uses_mode_buttons_after_locked_api_url(self):
+    def test_ui_uses_settings_panel_and_mode_buttons(self):
         ui_html = (PLUGIN_PATH.parent / "ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn('<label class="form-label">API URL</label>', ui_html)
+        self.assertIn('id="settingsPanel"', ui_html)
+        self.assertIn('id="openSettings"', ui_html)
+        self.assertIn('id="endpointInput"', ui_html)
         self.assertIn('class="mode-btn active"', ui_html)
         self.assertIn('data-mode="upscale"', ui_html)
-        self.assertLess(ui_html.index('API URL'), ui_html.index('生成模式'))
+        self.assertLess(ui_html.index('生成模式'), ui_html.index('id="settingsPanel"'))
         self.assertNotIn('id="generationModeSelect"', ui_html)
 
     def test_upstream_image_download_allows_invalid_tls(self):

@@ -125,6 +125,7 @@ def _save_single_param(key, value):
 # ===================== 默认参数 =====================
 
 _default_params = {
+    "endpoint": _GATEWAY_ENDPOINT,
     "gpt_api_key": "",
     "gemini_api_key": "",
     "model": "gemini-3.1-flash-image-preview",
@@ -149,7 +150,6 @@ _LOCAL_MAX_REFERENCE_TASKS = 20
 _LOCAL_MAX_DELIVERY_TASKS = 8
 _RETIRED_PARAM_KEYS = {
     "api_key",
-    "endpoint",
     "request_timeout",
     "download_timeout",
     "async_initial_delay",
@@ -339,8 +339,6 @@ def _clean_empty_credentials(src):
         if not str(data.get(key, "") or "").strip():
             data.pop(key, None)
 
-    data.pop("endpoint", None)
-
     return data
 
 
@@ -375,8 +373,17 @@ def _render_upscale_prompt(template, image_size, aspect_ratio):
 
 
 def _normalize_endpoint(endpoint):
-    del endpoint
-    return _GATEWAY_ENDPOINT
+    value = str(endpoint or _GATEWAY_ENDPOINT).strip()
+    if not value:
+        value = _GATEWAY_ENDPOINT
+
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise Exception("PLUGIN_ERROR:::API URL 必须是有效的 http 或 https 地址")
+    if parsed.query or parsed.fragment:
+        raise Exception("PLUGIN_ERROR:::API URL 不能包含查询参数或片段")
+
+    return value.rstrip("/")
 
 
 def _normalize_model(model):
@@ -1960,7 +1967,7 @@ def generate(context):
     prompt = str(context.get("prompt", "") or "").strip()
     reference_images = context.get("reference_images", {}) or {}
     output_dir = _get_output_dir(context)
-    endpoint = _GATEWAY_ENDPOINT
+    endpoint = _normalize_endpoint(params.get("endpoint", _GATEWAY_ENDPOINT))
     model = _normalize_model(params.get("model", "gemini-3.1-flash-image-preview"))
     api_key = _api_key_for_model(params, model)
     aspect_ratio = str(params.get("aspect_ratio", "16:9") or "16:9").strip()
