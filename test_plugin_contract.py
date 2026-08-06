@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -203,12 +204,14 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(progress_texts, ["已提交", "排队中", "下载中"])
         self.assertTrue(all(len(text) <= 3 for text in progress_texts))
 
-    def test_batch_uses_host_positions_and_serial_order(self):
+    def test_batch_submits_in_parallel_and_preserves_positions(self):
         request_ids = []
         session = _Session()
+        barrier = threading.Barrier(2, timeout=3)
 
         def fake_gemini(**kwargs):
             request_ids.append(kwargs["request_id"])
+            barrier.wait()
             return [{"type": "b64", "value": PNG_1X1}]
 
         with tempfile.TemporaryDirectory() as output_dir, \
@@ -221,8 +224,8 @@ class PluginContractTests(unittest.TestCase):
                 "viewer_index": 2,
                 "unique_name": "shot-a",
                 "generation_round": 3,
-                "output_position": [4, 1, 7],
-                "batch_num": 3,
+                "output_position": [4, 1],
+                "batch_num": 2,
                 "plugin_params": {
                     "gemini_api_key": "test-key",
                     "endpoint": "http://gateway.invalid",
@@ -235,12 +238,11 @@ class PluginContractTests(unittest.TestCase):
 
         self.assertEqual(
             [Path(path).name for path in paths],
-            ["0002_shot-a_3_4.png", "0002_shot-a_3_1.png", "0002_shot-a_3_7.png"],
+            ["0002_shot-a_3_4.png", "0002_shot-a_3_1.png"],
         )
-        self.assertEqual(len(request_ids), 3)
-        self.assertEqual(len(set(request_ids)), 3)
-        self.assertTrue(all(f"_{position}_" in request_id for request_id, position in zip(request_ids, [4, 1, 7])))
-        self.assertTrue(getattr(session, "closed", False))
+        self.assertEqual(len(request_ids), 2)
+        self.assertEqual(len(set(request_ids)), 2)
+        self.assertTrue(all(f"_{position}_" in request_id for request_id, position in zip(request_ids, [4, 1])))
 
     def test_cancelled_host_does_not_submit(self):
         session = _Session()

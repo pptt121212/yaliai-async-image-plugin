@@ -24,6 +24,7 @@ import threading
 import tempfile
 import uuid
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from requests.adapters import HTTPAdapter
 
@@ -1878,7 +1879,11 @@ def _legacy_generate(context):
 # ===================== 鸭梨 AI 异步生成入口 =====================
 
 def generate(context):
-    """Generate one host task, or a host-provided batch, in deterministic order."""
+    """Generate one host task, or a host-provided batch, in deterministic order.
+
+    Batch items are submitted and polled concurrently. Each worker owns its
+    HTTP session; results are sorted by output position before returning.
+    """
     context = context or {}
     params = _merge_runtime_params(context)
     prompt = str(context.get("prompt", "") or "").strip()
@@ -1916,22 +1921,32 @@ def generate(context):
 
     os.makedirs(output_dir, exist_ok=True)
     progress_callback = context.get("progress_callback")
+    progress_lock = threading.Lock()
+    progress_percent = 0
 
     def progress(text, percent=None):
+        nonlocal progress_percent
         if not progress_callback:
             return
-        try:
+        with progress_lock:
+            if percent is not None:
+                percent = max(progress_percent, min(100, int(percent)))
+                progress_percent = percent
             if percent is None:
-                progress_callback(text)
+                callback_args = (text,)
             else:
-                progress_callback(text, percent)
-        except TypeError:
+                callback_args = (text, percent)
+            try:
+                progress_callback(*callback_args)
+                return
+            except TypeError:
+                pass
+            except Exception:
+                return
             try:
                 progress_callback(text)
             except Exception:
                 pass
-        except Exception:
-            pass
 
     print("\n" + "=" * 60)
     print("鸭梨 AI 图像生成插件开始异步任务")
@@ -1942,129 +1957,136 @@ def generate(context):
     def is_cancelled():
         return _is_cancelled(context)
 
-    session = _new_http_session()
-    generated_files = []
-    try:
-        # The host normally expands a batch into independent tasks. This loop
-        # is the safe fallback for direct plugin calls that still carry batch_num.
-        for index in range(batch_num):
-            position = output_positions[index] if index < len(output_positions) else index
-            request_id = _new_request_id(context, position)
-            task_metadata = {
-                "model": model,
-                "quality": quality,
-                "image_size": image_size,
-                "aspect_ratio": aspect_ratio,
-                "protocol": "openai_image" if model in GPT_IMAGE_MODELS else "gemini",
-                "viewer_index": _safe_int(context.get("viewer_index", 0), 0),
-                "unique_name": str(context.get("unique_name", "") or ""),
-                "generation_round": _safe_int(context.get("generation_round", 0), 0),
-                "output_position": position,
-                "batch_index": index,
-                "batch_num": batch_num,
-                "reference_image_count": len(_normalize_reference_images(reference_images)),
-                "prompt_preview": _prompt_preview(prompt),
-            }
-            progress("生成中", 10 + int(index * 70 / batch_num))
-            if is_cancelled():
-                raise Exception("任务已被宿主取消")
+    generated_files = [None] * batch_num
 
-            if model in GPT_IMAGE_MODELS:
-                outputs = send_gpt_image_request(
-                    api_key=api_key,
-                    endpoint=endpoint,
-                    model=model,
-                    prompt=prompt,
-                    reference_images=reference_images,
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    quality=quality,
-                    request_timeout=request_timeout,
+    def run_one(index):
+        position = output_positions[index] if index < len(output_positions) else index
+        request_id = _new_request_id(context, position)
+        task_metadata = {
+            "model": model,
+            "quality": quality,
+            "image_size": image_size,
+            "aspect_ratio": aspect_ratio,
+            "protocol": "openai_image" if model in GPT_IMAGE_MODELS else "gemini",
+            "viewer_index": _safe_int(context.get("viewer_index", 0), 0),
+            "unique_name": str(context.get("unique_name", "") or ""),
+            "generation_round": _safe_int(context.get("generation_round", 0), 0),
+            "output_position": position,
+            "batch_index": index,
+            "batch_num": batch_num,
+            "reference_image_count": len(_normalize_reference_images(reference_images)),
+            "prompt_preview": _prompt_preview(prompt),
+        }
+        progress("生成中", 10 + int(index * 70 / batch_num))
+        if is_cancelled():
+            raise Exception("任务已被宿主取消")
+
+        if model in GPT_IMAGE_MODELS:
+            outputs = send_gpt_image_request(
+                api_key=api_key,
+                endpoint=endpoint,
+                model=model,
+                prompt=prompt,
+                reference_images=reference_images,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                quality=quality,
+                request_timeout=request_timeout,
+                download_timeout=download_timeout,
+                async_initial_delay=initial_delay,
+                async_poll_interval=poll_interval,
+                async_max_wait=max_wait,
+                progress=progress,
+                request_id=request_id,
+                is_cancelled=is_cancelled,
+                task_metadata=task_metadata,
+            )
+        else:
+            outputs = send_gemini_request(
+                api_key=api_key,
+                endpoint=endpoint,
+                model=model,
+                prompt=prompt,
+                reference_images=reference_images,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                request_timeout=request_timeout,
+                download_timeout=download_timeout,
+                async_initial_delay=initial_delay,
+                async_poll_interval=poll_interval,
+                async_max_wait=max_wait,
+                progress=progress,
+                request_id=request_id,
+                is_cancelled=is_cancelled,
+                task_metadata=task_metadata,
+            )
+
+        if not outputs:
+            raise Exception(f"第 {index + 1} 个鸭梨 AI 任务完成但没有图片输出")
+        if len(outputs) > 1:
+            print(f"警告：任务返回 {len(outputs)} 张图片；当前宿主槽位只接收第一张")
+        output = outputs[0]
+        task_id = str(output.get("task_id", "") or "")
+        progress("下载中", 82 + int(index * 12 / batch_num))
+        image_url = ""
+        try:
+            if output.get("type") == "url":
+                image_url = _absolute_gateway_url(endpoint, output.get("value"))
+                if not image_url:
+                    raise Exception("任务结果缺少图片 URL")
+                path = download_url_to_output(
+                    image_url,
+                    context,
+                    output_dir,
                     download_timeout=download_timeout,
-                    async_initial_delay=initial_delay,
-                    async_poll_interval=poll_interval,
-                    async_max_wait=max_wait,
-                    progress=progress,
-                    session=session,
-                    request_id=request_id,
+                    position_override=position,
                     is_cancelled=is_cancelled,
-                    task_metadata=task_metadata,
                 )
+            elif output.get("type") == "b64":
+                path = save_image_base64_to_output(output.get("value"), context, output_dir, position)
             else:
-                outputs = send_gemini_request(
-                    api_key=api_key,
-                    endpoint=endpoint,
-                    model=model,
-                    prompt=prompt,
-                    reference_images=reference_images,
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    request_timeout=request_timeout,
-                    download_timeout=download_timeout,
-                    async_initial_delay=initial_delay,
-                    async_poll_interval=poll_interval,
-                    async_max_wait=max_wait,
-                    progress=progress,
-                    session=session,
-                    request_id=request_id,
-                    is_cancelled=is_cancelled,
-                    task_metadata=task_metadata,
-                )
-
-            if not outputs:
-                raise Exception(f"第 {index + 1} 个鸭梨 AI 任务完成但没有图片输出")
-            if len(outputs) > 1:
-                print(f"警告：任务返回 {len(outputs)} 张图片；当前宿主槽位只接收第一张")
-            output = outputs[0]
-            task_id = str(output.get("task_id", "") or "")
-            progress("下载中", 82 + int(index * 12 / batch_num))
-            try:
-                if output.get("type") == "url":
-                    image_url = _absolute_gateway_url(endpoint, output.get("value"))
-                    if not image_url:
-                        raise Exception("任务结果缺少图片 URL")
-                    path = download_url_to_output(
-                        image_url,
-                        context,
-                        output_dir,
-                        download_timeout=download_timeout,
-                        position_override=position,
-                        session=session,
-                        is_cancelled=is_cancelled,
-                    )
-                elif output.get("type") == "b64":
-                    image_url = ""
-                    path = save_image_base64_to_output(output.get("value"), context, output_dir, position)
-                else:
-                    raise Exception("任务结果包含未知图片格式")
-            except Exception as delivery_error:
-                _record_async_task(
-                    "delivery_failed",
-                    task_id=task_id,
-                    status="download_failed",
-                    error=str(delivery_error),
-                    **task_metadata,
-                )
-                raise
-            generated_files.append(path)
+                raise Exception("任务结果包含未知图片格式")
+        except Exception as delivery_error:
             _record_async_task(
-                "delivered",
+                "delivery_failed",
                 task_id=task_id,
-                status="success",
-                output_path=os.path.abspath(path),
-                output_url=image_url,
-                output_type=output.get("type", ""),
+                status="download_failed",
+                error=str(delivery_error),
                 **task_metadata,
             )
-            progress("完成", 86 + int((index + 1) * 14 / batch_num))
+            raise
+        _record_async_task(
+            "delivered",
+            task_id=task_id,
+            status="success",
+            output_path=os.path.abspath(path),
+            output_url=image_url,
+            output_type=output.get("type", ""),
+            **task_metadata,
+        )
+        progress("完成", 86 + int((index + 1) * 14 / batch_num))
+        return index, path
+
+    try:
+        # Submit and deliver each batch item concurrently. Keep the returned
+        # list deterministic so the host maps files back to the right slots.
+        with ThreadPoolExecutor(max_workers=batch_num, thread_name_prefix="yaliai-image") as executor:
+            futures = [executor.submit(run_one, index) for index in range(batch_num)]
+            errors = []
+            for future in as_completed(futures):
+                try:
+                    index, path = future.result()
+                    generated_files[index] = path
+                except Exception as error:
+                    errors.append(error)
+            if errors:
+                raise errors[0]
 
         print(f"鸭梨 AI 异步任务完成，共保存 {len(generated_files)} 张图片")
         return generated_files
     except Exception as exc:
         print(f"鸭梨 AI 异步任务失败: {exc}")
         raise Exception(f"PLUGIN_ERROR:::{exc}") from exc
-    finally:
-        session.close()
 
 
 # ===================== 初始化 =====================
