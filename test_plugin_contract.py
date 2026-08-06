@@ -297,6 +297,7 @@ class PluginContractTests(unittest.TestCase):
         task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
         self.assertNotIn("分镜 / 输出", task_log_html)
         self.assertIn("generation_mode === 'upscale' ? '超分' : '默认'", task_log_html)
+        self.assertIn('.model { width: 175px;', task_log_html)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"
         ):
@@ -324,6 +325,14 @@ class PluginContractTests(unittest.TestCase):
             cleared = plugin.handle_action("clear_task_logs", {"mode": "all"})
             self.assertTrue(cleared["ok"])
             self.assertEqual(plugin.handle_action("get_task_logs")["total"], 0)
+
+    def test_ui_uses_mode_buttons_after_locked_api_url(self):
+        ui_html = (PLUGIN_PATH.parent / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<label class="form-label">API URL</label>', ui_html)
+        self.assertIn('class="mode-btn active"', ui_html)
+        self.assertIn('data-mode="upscale"', ui_html)
+        self.assertLess(ui_html.index('API URL'), ui_html.index('生成模式'))
+        self.assertNotIn('id="generationModeSelect"', ui_html)
 
     def test_upstream_image_download_allows_invalid_tls(self):
         session = _DownloadSession()
