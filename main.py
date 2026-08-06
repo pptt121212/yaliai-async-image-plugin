@@ -52,6 +52,7 @@ _CONFIG_PATH = plugin_dir / "config.json"
 _config_lock = threading.Lock()
 _ASYNC_TASK_LOG_PATH = plugin_dir / "async_tasks.jsonl"
 _async_task_log_lock = threading.Lock()
+_GATEWAY_ENDPOINT = "https://api.yaliai.com"
 
 
 def _load_config():
@@ -119,7 +120,6 @@ def _save_single_param(key, value):
 _default_params = {
     "gpt_api_key": "",
     "gemini_api_key": "",
-    "endpoint": "https://api.yaliai.com",
     "model": "gemini-3.1-flash-image-preview",
     "aspect_ratio": "16:9",
     "image_size": "4K",
@@ -139,6 +139,7 @@ _LOCAL_MAX_REFERENCE_TASKS = 20
 _LOCAL_MAX_DELIVERY_TASKS = 8
 _RETIRED_PARAM_KEYS = {
     "api_key",
+    "endpoint",
     "request_timeout",
     "download_timeout",
     "async_initial_delay",
@@ -323,8 +324,7 @@ def _clean_empty_credentials(src):
         if not str(data.get(key, "") or "").strip():
             data.pop(key, None)
 
-    if not str(data.get("endpoint", "") or "").strip():
-        data.pop("endpoint", None)
+    data.pop("endpoint", None)
 
     return data
 
@@ -345,12 +345,8 @@ def _prompt_preview(value, limit=120):
 
 
 def _normalize_endpoint(endpoint):
-    endpoint = str(endpoint or "").strip()
-
-    if not endpoint:
-        endpoint = _default_params["endpoint"]
-
-    return endpoint.rstrip("/")
+    del endpoint
+    return _GATEWAY_ENDPOINT
 
 
 def _normalize_model(model):
@@ -1929,7 +1925,7 @@ def generate(context):
     prompt = str(context.get("prompt", "") or "").strip()
     reference_images = context.get("reference_images", {}) or {}
     output_dir = _get_output_dir(context)
-    endpoint = _normalize_endpoint(params.get("endpoint", "https://api.yaliai.com"))
+    endpoint = _GATEWAY_ENDPOINT
     model = _normalize_model(params.get("model", "gemini-3.1-flash-image-preview"))
     api_key = _api_key_for_model(params, model)
     aspect_ratio = str(params.get("aspect_ratio", "16:9") or "16:9").strip()

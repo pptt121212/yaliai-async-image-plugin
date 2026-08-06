@@ -33,7 +33,7 @@
 
   <div class="form-row">
     <label class="form-label">鸭梨 AI Gateway 地址</label>
-    <div class="form-control"><input type="text" id="endpointInput" value="https://api.yaliai.com"></div>
+    <div class="form-control"><input type="text" value="https://api.yaliai.com/" readonly aria-readonly="true"></div>
   </div>
 
   <div class="form-row">
@@ -86,7 +86,6 @@
 
   <script>
     var defaults = {
-      endpoint: 'https://api.yaliai.com',
       model: 'gemini-3.1-flash-image-preview',
       aspect_ratio: '16:9',
       image_size: '4K',
@@ -95,7 +94,6 @@
     var fields = {
       gpt_api_key: document.getElementById('gptApiKeyInput'),
       gemini_api_key: document.getElementById('geminiApiKeyInput'),
-      endpoint: document.getElementById('endpointInput'),
       model: document.getElementById('modelSelect'),
       quality: document.getElementById('qualitySelect'),
       image_size: document.getElementById('imageSizeSelect'),

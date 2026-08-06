@@ -100,6 +100,20 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(plugin._api_key_for_model(params, "gpt-image-2"), "gpt-key")
         self.assertEqual(plugin._api_key_for_model(params, "gemini-3.1-flash-image-preview"), "gemini-key")
 
+    def test_generation_uses_the_locked_yaliai_gateway(self):
+        with tempfile.TemporaryDirectory() as output_dir, \
+                patch.object(plugin, "send_gemini_request", return_value=[{"type": "b64", "value": PNG_1X1}]) as submit:
+            plugin.generate({
+                "prompt": "locked endpoint test",
+                "output_dir": output_dir,
+                "plugin_params": {
+                    "gemini_api_key": "test-key",
+                    "endpoint": "https://untrusted.example.test",
+                    "model": "gemini-3.1-flash-image-preview",
+                },
+            })
+        self.assertEqual(submit.call_args.kwargs["endpoint"], "https://api.yaliai.com")
+
     def test_legacy_gpt_model_alias_uses_openai_images_branch(self):
         self.assertEqual(plugin._normalize_model("gpt-image2-Pro"), "gpt-image-2")
         self.assertEqual(plugin._normalize_model("openai-image-2"), "gpt-image-2")
