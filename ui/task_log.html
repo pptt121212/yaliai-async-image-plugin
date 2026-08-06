@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>鸭梨 AI 任务日志</title>
+  <link rel="stylesheet" href="../../../plugin-sdk.css">
+  <style>
+    body { padding: 16px 20px; }
+    h3 { margin: 0 0 12px; }
+    .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .toolbar input { min-width: 220px; }
+    .toolbar select { width: auto; min-width: 120px; }
+    .toolbar .spacer { flex: 1; }
+    .meta { color: var(--text-muted); font-size: 11px; }
+    .table-wrap { overflow: auto; max-height: calc(100vh - 150px); }
+    table { width: 100%; min-width: 900px; border-collapse: collapse; }
+    th { position: sticky; top: 0; background: var(--bg-primary); text-align: left; white-space: nowrap; }
+    td, th { padding: 7px 8px; border-bottom: 1px solid var(--border-color); vertical-align: top; font-size: 12px; }
+    .task-id { min-width: 190px; font-family: monospace; }
+    .time { white-space: nowrap; }
+    .status { white-space: nowrap; }
+    .detail { max-width: 420px; word-break: break-word; }
+    .detail a { color: var(--primary-color); display: block; margin-top: 3px; }
+    .error { color: var(--danger); }
+    .pager { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; }
+    .empty { color: var(--text-muted); text-align: center; padding: 36px; }
+  </style>
+</head>
+<body>
+  <h3>鸭梨 AI 任务日志</h3>
+  <div class="toolbar">
+    <select id="statusFilter">
+      <option value="">全部状态</option>
+      <option value="queued">排队中</option>
+      <option value="completed">已完成</option>
+      <option value="failed">失败</option>
+      <option value="timeout">超时</option>
+      <option value="cancelled">已取消</option>
+    </select>
+    <input id="taskIdInput" type="search" placeholder="搜索任务 ID">
+    <button id="searchBtn" type="button">查询</button>
+    <button id="clearOldBtn" type="button">清理 30 天前</button>
+    <button id="clearAllBtn" type="button">清空日志</button>
+    <span class="spacer"></span>
+    <span class="meta" id="countLabel"></span>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>任务 ID</th>
+          <th>状态</th>
+          <th>更新时间</th>
+          <th>事件数</th>
+          <th>追踪 / 请求 ID</th>
+          <th>结果 / 错误</th>
+        </tr>
+      </thead>
+      <tbody id="logBody"></tbody>
+    </table>
+    <div class="empty" id="emptyHint" hidden>暂无任务记录</div>
+  </div>
+
+  <div class="pager">
+    <button id="prevBtn" type="button">上一页</button>
+    <span class="meta" id="pageLabel">第 1 / 1 页</span>
+    <button id="nextBtn" type="button">下一页</button>
+  </div>
+
+  <script>
+    var PopupComm = {
+      _handlers: {},
+      send: function (action, data) {
+        if (window.opener) window.opener.postMessage({ __typetale_plugin: true, type: 'plugin_action', action: action, data: data || {} }, '*')
+      },
+      onAction: function (action, callback) {
+        if (!this._handlers[action]) this._handlers[action] = []
+        this._handlers[action].push(callback)
+      }
+    }
+    window.addEventListener('message', function (event) {
+      var data = event.data
+      if (!data || data.__typetale_plugin !== true || data.type !== 'action') return
+      ;(PopupComm._handlers[data.action] || []).forEach(function (callback) { try { callback(data.data) } catch (error) {} })
+    })
+
+    var page = 1
+    var pageSize = 20
+    var statusFilter = document.getElementById('statusFilter')
+    var taskIdInput = document.getElementById('taskIdInput')
+    var logBody = document.getElementById('logBody')
+    var emptyHint = document.getElementById('emptyHint')
+
+    function esc(value) {
+      var element = document.createElement('div')
+      element.textContent = value == null ? '' : String(value)
+      return element.innerHTML
+    }
+    function formatTime(value) {
+      if (!value) return '-'
+      return new Date(Number(value) * 1000).toLocaleString()
+    }
+    function loadLogs() {
+      PopupComm.send('get_task_logs', {
+        page: page,
+        page_size: pageSize,
+        status: statusFilter.value,
+        task_id: taskIdInput.value.trim()
+      })
+    }
+    function renderLogs(data) {
+      var tasks = data.tasks || []
+      logBody.innerHTML = ''
+      emptyHint.hidden = tasks.length !== 0
+      document.getElementById('countLabel').textContent = '共 ' + (data.total || 0) + ' 个任务'
+      document.getElementById('pageLabel').textContent = '第 ' + (data.page || 1) + ' / ' + (data.total_pages || 1) + ' 页'
+      document.getElementById('prevBtn').disabled = (data.page || 1) <= 1
+      document.getElementById('nextBtn').disabled = (data.page || 1) >= (data.total_pages || 1)
+      tasks.forEach(function (task) {
+        var row = document.createElement('tr')
+        var urls = (task.output_urls || []).map(function (url) {
+          return '<a href="' + esc(url) + '" target="_blank" rel="noreferrer">查看结果</a>'
+        }).join('')
+        var details = urls || (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '-')
+        row.innerHTML =
+          '<td class="task-id">' + esc(task.task_id) + '</td>' +
+          '<td class="status">' + esc(task.status || task.event || '-') + '</td>' +
+          '<td class="time">' + esc(formatTime(task.updated_at)) + '</td>' +
+          '<td>' + esc(task.event_count || 0) + '</td>' +
+          '<td class="detail">' + esc(task.trace_id || '-') + '<br>' + esc(task.request_id || '-') + '</td>' +
+          '<td class="detail">' + details + '</td>'
+        logBody.appendChild(row)
+      })
+    }
+
+    PopupComm.onAction('get_task_logs', function (data) { if (data && data.ok) renderLogs(data) })
+    PopupComm.onAction('clear_task_logs', function (data) {
+      if (data && data.ok) { page = 1; loadLogs() }
+    })
+    document.getElementById('searchBtn').addEventListener('click', function () { page = 1; loadLogs() })
+    statusFilter.addEventListener('change', function () { page = 1; loadLogs() })
+    taskIdInput.addEventListener('keydown', function (event) { if (event.key === 'Enter') { page = 1; loadLogs() } })
+    document.getElementById('prevBtn').addEventListener('click', function () { if (page > 1) { page--; loadLogs() } })
+    document.getElementById('nextBtn').addEventListener('click', function () { page++; loadLogs() })
+    document.getElementById('clearOldBtn').addEventListener('click', function () {
+      if (window.confirm('只清理 30 天前的任务日志，不会删除图片文件。继续吗？')) PopupComm.send('clear_task_logs', { mode: 'before', days: 30 })
+    })
+    document.getElementById('clearAllBtn').addEventListener('click', function () {
+      if (window.confirm('清空全部任务日志？不会删除图片文件。')) PopupComm.send('clear_task_logs', { mode: 'all' })
+    })
+    loadLogs()
+  </script>
+</body>
+</html>

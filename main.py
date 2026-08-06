@@ -428,6 +428,9 @@ def handle_action(action, data=None):
     if data is None:
         data = {}
 
+    if action == "open_task_logs":
+        return {"ok": True, "open_page": "task_log.html"}
+
     if action == "save_param":
         key = data.get("key")
         value = data.get("value")
@@ -469,8 +472,20 @@ def handle_action(action, data=None):
         }
 
     elif action == "get_task_logs":
-        limit = min(100, max(1, _safe_int(data.get("limit", 20), 20)))
-        return {"ok": True, "tasks": _get_recent_async_tasks(limit)}
+        page = max(1, _safe_int(data.get("page", 1), 1))
+        page_size = min(50, max(10, _safe_int(data.get("page_size", 20), 20)))
+        status = str(data.get("status", "") or "").strip().lower()
+        task_id = str(data.get("task_id", "") or "").strip()
+        return {"ok": True, **_query_async_task_logs(page, page_size, status, task_id)}
+
+    elif action == "clear_task_logs":
+        mode = str(data.get("mode", "before") or "before").strip().lower()
+        if mode == "all":
+            removed = _clear_async_task_logs()
+        else:
+            days = min(3650, max(1, _safe_int(data.get("days", 30), 30)))
+            removed = _clear_async_task_logs(before_timestamp=time.time() - days * 86400)
+        return {"ok": True, "removed": removed}
 
     return {"ok": False, "error": f"未知动作: {action}"}
 
@@ -488,37 +503,107 @@ def _record_async_task(event, **fields):
             handle.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
-def _get_recent_async_tasks(limit=20):
-    """Read a bounded tail of receipts without loading the whole task log."""
+def _read_async_task_events():
     if not _ASYNC_TASK_LOG_PATH.exists():
         return []
-    limit = max(1, int(limit))
+    events = []
     try:
-        with open(_ASYNC_TASK_LOG_PATH, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            position = handle.tell()
-            chunks = []
-            remaining = 256 * 1024
-            while position > 0 and remaining > 0:
-                size = min(8192, position, remaining)
-                position -= size
-                handle.seek(position)
-                chunks.append(handle.read(size))
-                remaining -= size
-                if b"\n".join(reversed(chunks)).count(b"\n") >= limit + 1:
-                    break
-        lines = b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()
-        entries = []
-        for line in lines[-limit:]:
-            try:
-                item = json.loads(line)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(item, dict):
-                entries.append(item)
-        return entries[::-1]
-    except OSError as exc:
-        return [{"event": "log_read_failed", "error": str(exc)}]
+        with _async_task_log_lock:
+            with open(_ASYNC_TASK_LOG_PATH, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        item = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(item, dict):
+                        events.append(item)
+    except OSError:
+        return []
+    return events
+
+
+def _summarize_async_task_events(events):
+    grouped = {}
+    for event in events:
+        task_id = str(event.get("task_id", "") or "").strip()
+        if not task_id:
+            continue
+        timestamp = _safe_int(event.get("timestamp", 0), 0)
+        summary = grouped.setdefault(task_id, {
+            "task_id": task_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "event_count": 0,
+            "event": "",
+            "status": "",
+            "error": "",
+            "trace_id": "",
+            "request_id": "",
+            "query_path": "",
+            "output_count": 0,
+            "output_urls": [],
+        })
+        summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
+        summary["updated_at"] = max(summary["updated_at"], timestamp)
+        summary["event_count"] += 1
+        summary["event"] = str(event.get("event", "") or summary["event"])
+        for key in ("status", "error", "trace_id", "request_id", "query_path"):
+            if event.get(key) not in (None, ""):
+                summary[key] = event[key]
+        if event.get("output_count") is not None:
+            summary["output_count"] = event.get("output_count")
+        for url in event.get("output_urls", []) if isinstance(event.get("output_urls"), list) else []:
+            if url and url not in summary["output_urls"]:
+                summary["output_urls"].append(url)
+    return sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
+
+
+def _query_async_task_logs(page, page_size, status="", task_id=""):
+    tasks = _summarize_async_task_events(_read_async_task_events())
+    if task_id:
+        tasks = [item for item in tasks if task_id.lower() in item["task_id"].lower()]
+    if status:
+        tasks = [item for item in tasks if str(item.get("status", "")).lower() == status]
+    total = len(tasks)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * page_size
+    return {
+        "tasks": tasks[start:start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
+def _clear_async_task_logs(before_timestamp=None):
+    if not _ASYNC_TASK_LOG_PATH.exists():
+        return 0
+    with _async_task_log_lock:
+        try:
+            with open(_ASYNC_TASK_LOG_PATH, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+            if before_timestamp is None:
+                kept = []
+            else:
+                kept = []
+                for line in lines:
+                    try:
+                        item = json.loads(line)
+                    except (TypeError, ValueError):
+                        kept.append(line)
+                        continue
+                    if _safe_int(item.get("timestamp", 0), 0) >= before_timestamp:
+                        kept.append(line)
+            removed = len(lines) - len(kept)
+            temp_path = _ASYNC_TASK_LOG_PATH.with_suffix(".jsonl.tmp")
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                handle.writelines(kept)
+            os.replace(temp_path, _ASYNC_TASK_LOG_PATH)
+            return removed
+        except OSError:
+            return 0
 
 
 def _new_http_session():

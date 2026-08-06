@@ -98,6 +98,24 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(plugin._api_key_for_model(params, "gpt-image-2"), "gpt-key")
         self.assertEqual(plugin._api_key_for_model(params, "gemini-3.1-flash-image-preview"), "gemini-key")
 
+    def test_task_log_popup_groups_events_and_can_clear(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"
+        ):
+            plugin._record_async_task("accepted", task_id="task-1", status="queued")
+            plugin._record_async_task("status", task_id="task-1", status="processing")
+            plugin._record_async_task("completed", task_id="task-1", status="completed", output_count=1)
+
+            page = plugin.handle_action("get_task_logs", {"page": 1, "page_size": 10})
+            self.assertTrue(page["ok"])
+            self.assertEqual(page["total"], 1)
+            self.assertEqual(page["tasks"][0]["event_count"], 3)
+            self.assertEqual(plugin.handle_action("open_task_logs")["open_page"], "task_log.html")
+
+            cleared = plugin.handle_action("clear_task_logs", {"mode": "all"})
+            self.assertTrue(cleared["ok"])
+            self.assertEqual(plugin.handle_action("get_task_logs")["total"], 0)
+
     def test_upstream_image_download_allows_invalid_tls(self):
         session = _DownloadSession()
         with tempfile.TemporaryDirectory() as output_dir:

@@ -10,7 +10,6 @@
     .api-key-wrapper input { flex: 1; padding-right: 36px; }
     .toggle-eye { position: absolute; right: 8px; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; padding: 2px 4px; }
     .task-log { margin-top: 14px; }
-    .task-log pre { max-height: 160px; overflow: auto; white-space: pre-wrap; font-size: 11px; color: var(--text-muted); }
   </style>
 </head>
 <body>
@@ -82,8 +81,7 @@
   </div>
 
   <div class="task-log">
-    <button id="refreshTaskLog" type="button">查看最近任务</button>
-    <pre id="taskLogOutput" aria-live="polite"></pre>
+    <button id="openTaskLog" type="button">打开任务日志</button>
   </div>
 
   <script>
@@ -151,20 +149,8 @@
     })
     Object.keys(fields).forEach(function (key) { fields[key].addEventListener('change', function () { save(key) }) })
     PluginSDK.onAction('load_params', function (result) { if (result && result.ok) applyParams(result.params) })
-    PluginSDK.onAction('get_task_logs', function (result) {
-      var output = document.getElementById('taskLogOutput')
-      if (!result || !result.ok) { output.textContent = '任务记录读取失败'; return }
-      output.textContent = (result.tasks || []).map(function (item) {
-        var task = item.task_id || '-'
-        var event = item.event || '-'
-        var status = item.status || '-'
-        var error = item.error ? ' ' + item.error : ''
-        var urls = item.output_urls && item.output_urls.length ? ' ' + item.output_urls.join(' ') : ''
-        return task + '  ' + event + '  ' + status + error + urls
-      }).join('\n') || '暂无任务记录'
-    })
-    document.getElementById('refreshTaskLog').addEventListener('click', function () {
-      if (sdkReady) PluginSDK.sendAction('get_task_logs', { limit: 20 })
+    document.getElementById('openTaskLog').addEventListener('click', function () {
+      if (sdkReady) PluginSDK.sendAction('open_task_logs')
     })
     PluginSDK.onReady(function (params) {
       sdkReady = true
