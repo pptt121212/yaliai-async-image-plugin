@@ -211,6 +211,43 @@ class PluginContractTests(unittest.TestCase):
         ])
         self.assertEqual(calls[1][2].keys(), {0})
 
+    def test_upscale_cross_protocol_keeps_semantic_size_for_gemini(self):
+        source_calls = []
+        upscale_calls = []
+
+        def fake_gpt(**kwargs):
+            source_calls.append(kwargs)
+            return [{"type": "b64", "value": PNG_1X1, "task_id": "source-task"}]
+
+        def fake_gemini(**kwargs):
+            upscale_calls.append(kwargs)
+            return [{"type": "b64", "value": PNG_1X1, "task_id": "upscale-task"}]
+
+        with tempfile.TemporaryDirectory() as output_dir, \
+                patch.object(plugin, "send_gpt_image_request", side_effect=fake_gpt), \
+                patch.object(plugin, "send_gemini_request", side_effect=fake_gemini):
+            plugin.generate({
+                "prompt": "cross protocol upscale test",
+                "output_dir": output_dir,
+                "plugin_params": {
+                    "gpt_api_key": "source-key",
+                    "gemini_api_key": "upscale-key",
+                    "model": "gpt-image-2",
+                    "generation_mode": "upscale",
+                    "upscale_model": "gemini-3-pro-image-preview",
+                    "upscale_prompt": "enhance {{image_size}} {{aspect_ratio}}",
+                    "image_size": "4K",
+                    "aspect_ratio": "16:9",
+                },
+            })
+
+        self.assertEqual(source_calls[0]["image_size"], "4K")
+        self.assertEqual(source_calls[0]["aspect_ratio"], "16:9")
+        self.assertEqual(upscale_calls[0]["image_size"], "4K")
+        self.assertEqual(upscale_calls[0]["aspect_ratio"], "16:9")
+        self.assertNotEqual(upscale_calls[0]["image_size"], "3840x2160")
+        self.assertEqual(upscale_calls[0]["api_key"], "upscale-key")
+
     def test_upscale_mode_validates_second_model_key_before_source_request(self):
         with tempfile.TemporaryDirectory() as output_dir, patch.object(
             plugin, "send_gemini_request"
