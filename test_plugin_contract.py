@@ -336,6 +336,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn('id="openSettings"', ui_html)
         self.assertIn('id="endpointInput"', ui_html)
         self.assertIn('.settings-backdrop[hidden] { display: none; }', ui_html)
+        self.assertIn('.form-row[hidden] { display: none; }', ui_html)
         self.assertIn('class="mode-btn active"', ui_html)
         self.assertIn('data-mode="upscale"', ui_html)
         self.assertLess(ui_html.index('生成模式'), ui_html.index('id="settingsPanel"'))
