@@ -2,6 +2,7 @@ import base64
 import importlib.util
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -243,6 +244,92 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(len(request_ids), 2)
         self.assertEqual(len(set(request_ids)), 2)
         self.assertTrue(all(f"_{position}_" in request_id for request_id, position in zip(request_ids, [4, 1])))
+
+    def test_reference_batch_limits_local_uploads_to_twenty_tasks(self):
+        active = 0
+        peak_active = 0
+        active_lock = threading.Lock()
+
+        def fake_gemini(**_kwargs):
+            nonlocal active, peak_active
+            with active_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                time.sleep(0.05)
+                return [{"type": "b64", "value": PNG_1X1}]
+            finally:
+                with active_lock:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as output_dir, patch.object(
+            plugin, "send_gemini_request", side_effect=fake_gemini
+        ):
+            paths = plugin.generate({
+                "prompt": "reference concurrency test",
+                "reference_images": {"first": "C:/reference.png"},
+                "output_dir": output_dir,
+                "output_position": list(range(25)),
+                "batch_num": 25,
+                "plugin_params": {
+                    "gemini_api_key": "test-key",
+                    "endpoint": "http://gateway.invalid",
+                    "model": "gemini-3.1-flash-image-preview",
+                },
+            })
+
+        self.assertEqual(len(paths), 25)
+        self.assertEqual(peak_active, 20)
+
+    def test_global_gate_limits_multiple_host_calls_to_forty_tasks(self):
+        active = 0
+        peak_active = 0
+        active_lock = threading.Lock()
+        errors = []
+
+        def fake_gemini(**_kwargs):
+            nonlocal active, peak_active
+            with active_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                time.sleep(0.05)
+                return [{"type": "b64", "value": PNG_1X1}]
+            finally:
+                with active_lock:
+                    active -= 1
+
+        def call_plugin(output_dir, unique_name):
+            try:
+                plugin.generate({
+                    "prompt": "global queue test",
+                    "output_dir": output_dir,
+                    "unique_name": unique_name,
+                    "output_position": list(range(25)),
+                    "batch_num": 25,
+                    "plugin_params": {
+                        "gemini_api_key": "test-key",
+                        "endpoint": "http://gateway.invalid",
+                        "model": "gemini-3.1-flash-image-preview",
+                    },
+                })
+            except Exception as error:
+                errors.append(error)
+
+        with tempfile.TemporaryDirectory() as output_dir, patch.object(
+            plugin, "send_gemini_request", side_effect=fake_gemini
+        ):
+            first = threading.Thread(target=call_plugin, args=(str(Path(output_dir) / "first"), "first"))
+            second = threading.Thread(target=call_plugin, args=(str(Path(output_dir) / "second"), "second"))
+            first.start()
+            second.start()
+            first.join(timeout=10)
+            second.join(timeout=10)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(peak_active, 40)
 
     def test_cancelled_host_does_not_submit(self):
         session = _Session()

@@ -24,6 +24,7 @@ import threading
 import tempfile
 import uuid
 import requests
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from requests.adapters import HTTPAdapter
@@ -132,6 +133,10 @@ _IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 300
 _ASYNC_INITIAL_DELAY_SECONDS = 30
 _ASYNC_POLL_INTERVAL_SECONDS = 5
 _ASYNC_MAX_WAIT_SECONDS = 1800
+_MAX_BATCH_NUM = 100
+_LOCAL_MAX_ACTIVE_TASKS = 40
+_LOCAL_MAX_REFERENCE_TASKS = 20
+_LOCAL_MAX_DELIVERY_TASKS = 8
 _RETIRED_PARAM_KEYS = {
     "api_key",
     "request_timeout",
@@ -141,6 +146,41 @@ _RETIRED_PARAM_KEYS = {
     "async_max_wait",
     "retry_count",
 }
+
+
+class _FifoGate:
+    """A cancellable FIFO concurrency gate shared by every plugin call."""
+
+    def __init__(self, limit):
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._waiters = deque()
+        self._condition = threading.Condition()
+
+    def acquire(self, is_cancelled):
+        token = object()
+        with self._condition:
+            self._waiters.append(token)
+            while self._active >= self._limit or self._waiters[0] is not token:
+                if is_cancelled():
+                    self._waiters.remove(token)
+                    self._condition.notify_all()
+                    raise Exception("任务已被宿主取消")
+                self._condition.wait(timeout=0.5)
+            self._waiters.popleft()
+            self._active += 1
+
+    def release(self):
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            self._condition.notify_all()
+
+
+# Keep a local workstation responsive when the host queues many frames. A
+# reference image consumes upload bandwidth as well as an active task slot.
+_local_task_gate = _FifoGate(_LOCAL_MAX_ACTIVE_TASKS)
+_local_reference_gate = _FifoGate(_LOCAL_MAX_REFERENCE_TASKS)
+_local_delivery_gate = _FifoGate(_LOCAL_MAX_DELIVERY_TASKS)
 
 
 def _ensure_config_exists():
@@ -1901,8 +1941,8 @@ def generate(context):
     poll_interval = _ASYNC_POLL_INTERVAL_SECONDS
     max_wait = _ASYNC_MAX_WAIT_SECONDS
     batch_num = _safe_int(context.get("batch_num", 1), 1)
-    if batch_num < 1 or batch_num > 16:
-        raise Exception("PLUGIN_ERROR:::batch_num 必须在 1 到 16 之间")
+    if batch_num < 1 or batch_num > _MAX_BATCH_NUM:
+        raise Exception(f"PLUGIN_ERROR:::batch_num 必须在 1 到 {_MAX_BATCH_NUM} 之间")
     output_positions = context.get("output_position")
     if not isinstance(output_positions, (list, tuple)):
         output_positions = []
@@ -1959,7 +1999,9 @@ def generate(context):
 
     generated_files = [None] * batch_num
 
-    def run_one(index):
+    reference_image_count = len(_normalize_reference_images(reference_images))
+
+    def execute_one(index):
         position = output_positions[index] if index < len(output_positions) else index
         request_id = _new_request_id(context, position)
         task_metadata = {
@@ -1974,7 +2016,7 @@ def generate(context):
             "output_position": position,
             "batch_index": index,
             "batch_num": batch_num,
-            "reference_image_count": len(_normalize_reference_images(reference_images)),
+            "reference_image_count": reference_image_count,
             "prompt_preview": _prompt_preview(prompt),
         }
         progress("生成中", 10 + int(index * 70 / batch_num))
@@ -2029,7 +2071,10 @@ def generate(context):
         task_id = str(output.get("task_id", "") or "")
         progress("下载中", 82 + int(index * 12 / batch_num))
         image_url = ""
+        delivery_slot = False
         try:
+            _local_delivery_gate.acquire(is_cancelled)
+            delivery_slot = True
             if output.get("type") == "url":
                 image_url = _absolute_gateway_url(endpoint, output.get("value"))
                 if not image_url:
@@ -2055,6 +2100,9 @@ def generate(context):
                 **task_metadata,
             )
             raise
+        finally:
+            if delivery_slot:
+                _local_delivery_gate.release()
         _record_async_task(
             "delivered",
             task_id=task_id,
@@ -2067,10 +2115,30 @@ def generate(context):
         progress("完成", 86 + int((index + 1) * 14 / batch_num))
         return index, path
 
+    def run_one(index):
+        reference_slot = False
+        task_slot = False
+        progress("排队中", 5)
+        try:
+            if reference_image_count:
+                _local_reference_gate.acquire(is_cancelled)
+                reference_slot = True
+            _local_task_gate.acquire(is_cancelled)
+            task_slot = True
+            return execute_one(index)
+        finally:
+            if task_slot:
+                _local_task_gate.release()
+            if reference_slot:
+                _local_reference_gate.release()
+
     try:
         # Submit and deliver each batch item concurrently. Keep the returned
         # list deterministic so the host maps files back to the right slots.
-        with ThreadPoolExecutor(max_workers=batch_num, thread_name_prefix="yaliai-image") as executor:
+        with ThreadPoolExecutor(
+            max_workers=min(batch_num, _LOCAL_MAX_ACTIVE_TASKS),
+            thread_name_prefix="yaliai-image",
+        ) as executor:
             futures = [executor.submit(run_one, index) for index in range(batch_num)]
             errors = []
             for future in as_completed(futures):
