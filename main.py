@@ -425,8 +425,8 @@ def get_params():
 
 def get_info():
     return {
-        "name": "鸭梨 AI 图像生成插件",
-        "description": "通过鸭梨 AI 网关异步生成图片，支持 Gemini 原生接口和 OpenAI Images 文件上传。",
+        "name": "鸭梨 AI 异步图像生成插件",
+        "description": "通过鸭梨 AI 网关异步生成图片，支持 Gemini 原生接口、OpenAI Images 文件上传和任务日志。",
         "version": "3.1.0",
         "author": "Yali AI",
     }
