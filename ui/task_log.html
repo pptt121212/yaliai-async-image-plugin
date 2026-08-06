@@ -13,14 +13,18 @@
     .toolbar .spacer { flex: 1; }
     .meta { color: var(--text-muted); font-size: 11px; }
     .table-wrap { overflow: auto; max-height: calc(100vh - 150px); }
-    table { width: 100%; min-width: 900px; border-collapse: collapse; }
+    table { width: 100%; min-width: 1180px; border-collapse: collapse; }
     th { position: sticky; top: 0; background: var(--bg-primary); text-align: left; white-space: nowrap; }
     td, th { padding: 7px 8px; border-bottom: 1px solid var(--border-color); vertical-align: top; font-size: 12px; }
     .task-id { min-width: 190px; font-family: monospace; }
+    .panel { min-width: 150px; white-space: nowrap; }
+    .model { min-width: 230px; }
     .time { white-space: nowrap; }
     .status { white-space: nowrap; }
-    .detail { max-width: 420px; word-break: break-word; }
+    .detail { max-width: 360px; word-break: break-word; }
     .detail a { color: var(--primary-color); display: block; margin-top: 3px; }
+    .prompt { max-width: 280px; color: var(--text-muted); word-break: break-word; }
+    .preview { width: 96px; height: 72px; object-fit: contain; background: var(--bg-secondary); display: block; margin-bottom: 4px; }
     .error { color: var(--danger); }
     .pager { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; }
     .empty { color: var(--text-muted); text-align: center; padding: 36px; }
@@ -32,8 +36,11 @@
     <select id="statusFilter">
       <option value="">全部状态</option>
       <option value="queued">排队中</option>
-      <option value="completed">已完成</option>
-      <option value="failed">失败</option>
+      <option value="processing">处理中</option>
+      <option value="completed">上游已完成</option>
+      <option value="success">已交付</option>
+      <option value="download_failed">交付失败</option>
+      <option value="failed">生成失败</option>
       <option value="timeout">超时</option>
       <option value="cancelled">已取消</option>
     </select>
@@ -50,11 +57,12 @@
       <thead>
         <tr>
           <th>任务 ID</th>
+          <th>分镜 / 输出</th>
+          <th>模型与参数</th>
           <th>状态</th>
           <th>更新时间</th>
-          <th>事件数</th>
-          <th>追踪 / 请求 ID</th>
-          <th>结果 / 错误</th>
+          <th>提示词预览</th>
+          <th>图片 / 追踪 / 错误</th>
         </tr>
       </thead>
       <tbody id="logBody"></tbody>
@@ -101,6 +109,11 @@
       if (!value) return '-'
       return new Date(Number(value) * 1000).toLocaleString()
     }
+    function localFileUrl(value) {
+      if (!value) return ''
+      if (/^https?:\/\//i.test(value)) return value
+      return 'file:///' + String(value).replace(/\\/g, '/')
+    }
     function loadLogs() {
       PopupComm.send('get_task_logs', {
         page: page,
@@ -119,17 +132,23 @@
       document.getElementById('nextBtn').disabled = (data.page || 1) >= (data.total_pages || 1)
       tasks.forEach(function (task) {
         var row = document.createElement('tr')
-        var urls = (task.output_urls || []).map(function (url) {
-          return '<a href="' + esc(url) + '" target="_blank" rel="noreferrer">查看结果</a>'
+        var imageUrl = (task.output_urls || [])[0] || localFileUrl(task.output_path)
+        var image = imageUrl ? '<a href="' + esc(imageUrl) + '" target="_blank" rel="noreferrer"><img class="preview" src="' + esc(imageUrl) + '" alt="生成结果预览"></a>' : ''
+        var links = (task.output_urls || []).map(function (url) {
+          return '<a href="' + esc(url) + '" target="_blank" rel="noreferrer">打开图片 URL</a>'
         }).join('')
-        var details = urls || (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '-')
+        var result = image + links + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
+        var panel = '序号 ' + esc(task.viewer_index || '-') + '<br>槽位 ' + esc(task.output_position || '-') + '<br>' + esc(task.unique_name || '-')
+        var settings = esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
+        var trace = esc(task.trace_id || '-') + '<br>' + esc(task.request_id || '-')
         row.innerHTML =
           '<td class="task-id">' + esc(task.task_id) + '</td>' +
-          '<td class="status">' + esc(task.status || task.event || '-') + '</td>' +
+          '<td class="panel">' + panel + '</td>' +
+          '<td class="model">' + settings + '</td>' +
+          '<td class="status">' + esc(task.status || task.event || '-') + '<br>事件 ' + esc(task.event_count || 0) + '</td>' +
           '<td class="time">' + esc(formatTime(task.updated_at)) + '</td>' +
-          '<td>' + esc(task.event_count || 0) + '</td>' +
-          '<td class="detail">' + esc(task.trace_id || '-') + '<br>' + esc(task.request_id || '-') + '</td>' +
-          '<td class="detail">' + details + '</td>'
+          '<td class="prompt" title="' + esc(task.prompt_preview || '') + '">' + esc(task.prompt_preview || '-') + '</td>' +
+          '<td class="detail">' + result + '<br><small>' + trace + '</small></td>'
         logBody.appendChild(row)
       })
     }

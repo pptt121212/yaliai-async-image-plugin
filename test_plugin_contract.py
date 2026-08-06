@@ -102,14 +102,25 @@ class PluginContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"
         ):
-            plugin._record_async_task("accepted", task_id="task-1", status="queued")
+            plugin._record_async_task(
+                "accepted", task_id="task-1", status="queued", model="gpt-image-2",
+                viewer_index=4, output_position=2, image_size="4K", request_size="3840x2160",
+                aspect_ratio="16:9", quality="medium", prompt_preview="task preview",
+            )
             plugin._record_async_task("status", task_id="task-1", status="processing")
             plugin._record_async_task("completed", task_id="task-1", status="completed", output_count=1)
+            plugin._record_async_task(
+                "delivered", task_id="task-1", status="success", output_path="C:/outputs/task-1.png",
+                output_url="https://api.yaliai.com/v1/generated-images/task-1.png",
+            )
 
             page = plugin.handle_action("get_task_logs", {"page": 1, "page_size": 10})
             self.assertTrue(page["ok"])
             self.assertEqual(page["total"], 1)
-            self.assertEqual(page["tasks"][0]["event_count"], 3)
+            self.assertEqual(page["tasks"][0]["event_count"], 4)
+            self.assertEqual(page["tasks"][0]["viewer_index"], 4)
+            self.assertEqual(page["tasks"][0]["request_size"], "3840x2160")
+            self.assertEqual(page["tasks"][0]["status"], "success")
             self.assertEqual(plugin.handle_action("open_task_logs")["open_page"], "task_log.html")
 
             cleared = plugin.handle_action("clear_task_logs", {"mode": "all"})
@@ -155,7 +166,7 @@ class PluginContractTests(unittest.TestCase):
             )
 
         self.assertEqual(accepted["task_id"], "task-contract-1")
-        self.assertEqual(outputs, [{"type": "url", "value": "https://api.yaliai.com/v1/generated-images/test.png"}])
+        self.assertEqual(outputs, [{"type": "url", "value": "https://api.yaliai.com/v1/generated-images/test.png", "task_id": "task-contract-1"}])
         headers = session.post_calls[0][1]["headers"]
         self.assertEqual(headers["Idempotency-Key"], request_id)
         self.assertEqual(headers["X-Request-ID"], request_id)

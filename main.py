@@ -288,6 +288,14 @@ def _safe_int(value, default):
         return default
 
 
+def _prompt_preview(value, limit=120):
+    """Keep only a bounded, Unicode-safe prompt hint for local task logs."""
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
 def _normalize_endpoint(endpoint):
     endpoint = str(endpoint or "").strip()
 
@@ -542,12 +550,32 @@ def _summarize_async_task_events(events):
             "query_path": "",
             "output_count": 0,
             "output_urls": [],
+            "output_path": "",
+            "output_type": "",
+            "model": "",
+            "quality": "",
+            "image_size": "",
+            "aspect_ratio": "",
+            "request_size": "",
+            "protocol": "",
+            "viewer_index": 0,
+            "unique_name": "",
+            "generation_round": 0,
+            "output_position": 0,
+            "batch_index": 0,
+            "batch_num": 1,
+            "reference_image_count": 0,
+            "prompt_preview": "",
         })
         summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
         summary["updated_at"] = max(summary["updated_at"], timestamp)
         summary["event_count"] += 1
         summary["event"] = str(event.get("event", "") or summary["event"])
-        for key in ("status", "error", "trace_id", "request_id", "query_path"):
+        for key in (
+            "status", "error", "trace_id", "request_id", "query_path", "output_path", "output_type",
+            "model", "quality", "image_size", "aspect_ratio", "request_size", "protocol", "viewer_index", "unique_name",
+            "generation_round", "output_position", "batch_index", "batch_num", "reference_image_count", "prompt_preview",
+        ):
             if event.get(key) not in (None, ""):
                 summary[key] = event[key]
         if event.get("output_count") is not None:
@@ -555,6 +583,8 @@ def _summarize_async_task_events(events):
         for url in event.get("output_urls", []) if isinstance(event.get("output_urls"), list) else []:
             if url and url not in summary["output_urls"]:
                 summary["output_urls"].append(url)
+        if event.get("output_url") and event["output_url"] not in summary["output_urls"]:
+            summary["output_urls"].append(event["output_url"])
     return sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
 
 
@@ -679,7 +709,7 @@ def _decode_json_response(response, label):
         raise Exception(f"{label} 返回非 JSON（HTTP {response.status_code}）: {response.text[:1000]}") from exc
 
 
-def _submit_async_request(session, url, api_key, request_id, request_timeout, *, json_payload=None, form_data=None, files=None):
+def _submit_async_request(session, url, api_key, request_id, request_timeout, *, json_payload=None, form_data=None, files=None, task_metadata=None):
     headers = _gateway_headers(api_key, request_id)
     if json_payload is not None:
         headers["Content-Type"] = "application/json"
@@ -707,6 +737,7 @@ def _submit_async_request(session, url, api_key, request_id, request_timeout, *,
         request_id=request_id,
         status=payload.get("status", "queued"),
         provider="yaliai_gateway",
+        **(task_metadata or {}),
     )
     return payload
 
@@ -793,6 +824,8 @@ def _poll_async_task(session, endpoint, api_key, accepted, request_timeout, init
                 output_urls=[item["value"] for item in outputs if item.get("type") == "url"],
                 output_kinds=[item.get("type", "") for item in outputs],
             )
+            for item in outputs:
+                item["task_id"] = task_id
             progress("任务完成，开始按顺序下载图片", 85)
             return outputs
         if status in {"failed", "cancelled", "canceled", "expired"}:
@@ -1066,6 +1099,7 @@ def send_gemini_request(
     session=None,
     request_id=None,
     is_cancelled=lambda: False,
+    task_metadata=None,
 ):
     """Submit native Gemini JSON to the Gateway's durable async queue."""
     endpoint = _normalize_endpoint(endpoint)
@@ -1108,6 +1142,7 @@ def send_gemini_request(
             request_id,
             request_timeout,
             json_payload=payload,
+            task_metadata=task_metadata,
         )
         return _poll_async_task(
             session,
@@ -1544,10 +1579,13 @@ def send_gpt_image_request(
     session=None,
     request_id=None,
     is_cancelled=lambda: False,
+    task_metadata=None,
 ):
     """Submit OpenAI Images JSON/multipart input to the durable async API."""
     endpoint = _normalize_endpoint(endpoint)
     size = build_gpt_image_size(aspect_ratio, image_size)
+    submission_metadata = dict(task_metadata or {})
+    submission_metadata["request_size"] = size
     ref_pack = _collect_valid_reference_images(reference_images)
     local_refs = ref_pack["local"]
     url_refs = ref_pack["urls"]
@@ -1581,6 +1619,7 @@ def send_gpt_image_request(
                 request_timeout,
                 form_data=common,
                 files=files,
+                task_metadata=submission_metadata,
             )
         elif url_refs:
             url = f"{endpoint}/v1/images/edits"
@@ -1593,6 +1632,7 @@ def send_gpt_image_request(
                 request_id,
                 request_timeout,
                 json_payload=payload,
+                task_metadata=submission_metadata,
             )
         else:
             url = f"{endpoint}/v1/images/generations"
@@ -1603,6 +1643,7 @@ def send_gpt_image_request(
                 request_id,
                 request_timeout,
                 json_payload=common,
+                task_metadata=submission_metadata,
             )
     finally:
         for handle in handles:
@@ -1886,6 +1927,21 @@ def generate(context):
         for index in range(batch_num):
             position = output_positions[index] if index < len(output_positions) else index
             request_id = _new_request_id(context, position)
+            task_metadata = {
+                "model": model,
+                "quality": quality,
+                "image_size": image_size,
+                "aspect_ratio": aspect_ratio,
+                "protocol": "openai_image" if model in GPT_IMAGE_MODELS else "gemini",
+                "viewer_index": _safe_int(context.get("viewer_index", 0), 0),
+                "unique_name": str(context.get("unique_name", "") or ""),
+                "generation_round": _safe_int(context.get("generation_round", 0), 0),
+                "output_position": position,
+                "batch_index": index,
+                "batch_num": batch_num,
+                "reference_image_count": len(_normalize_reference_images(reference_images)),
+                "prompt_preview": _prompt_preview(prompt),
+            }
             progress(f"正在生成第 {index + 1}/{batch_num} 张图片", 10 + int(index * 70 / batch_num))
             if is_cancelled():
                 raise Exception("任务已被宿主取消")
@@ -1909,6 +1965,7 @@ def generate(context):
                     session=session,
                     request_id=request_id,
                     is_cancelled=is_cancelled,
+                    task_metadata=task_metadata,
                 )
             else:
                 outputs = send_gemini_request(
@@ -1928,6 +1985,7 @@ def generate(context):
                     session=session,
                     request_id=request_id,
                     is_cancelled=is_cancelled,
+                    task_metadata=task_metadata,
                 )
 
             if not outputs:
@@ -1935,25 +1993,46 @@ def generate(context):
             if len(outputs) > 1:
                 print(f"警告：任务返回 {len(outputs)} 张图片；当前宿主槽位只接收第一张")
             output = outputs[0]
+            task_id = str(output.get("task_id", "") or "")
             progress(f"正在下载第 {index + 1}/{batch_num} 张图片", 82 + int(index * 12 / batch_num))
-            if output.get("type") == "url":
-                image_url = _absolute_gateway_url(endpoint, output.get("value"))
-                if not image_url:
-                    raise Exception("任务结果缺少图片 URL")
-                path = download_url_to_output(
-                    image_url,
-                    context,
-                    output_dir,
-                    download_timeout=download_timeout,
-                    position_override=position,
-                    session=session,
-                    is_cancelled=is_cancelled,
+            try:
+                if output.get("type") == "url":
+                    image_url = _absolute_gateway_url(endpoint, output.get("value"))
+                    if not image_url:
+                        raise Exception("任务结果缺少图片 URL")
+                    path = download_url_to_output(
+                        image_url,
+                        context,
+                        output_dir,
+                        download_timeout=download_timeout,
+                        position_override=position,
+                        session=session,
+                        is_cancelled=is_cancelled,
+                    )
+                elif output.get("type") == "b64":
+                    image_url = ""
+                    path = save_image_base64_to_output(output.get("value"), context, output_dir, position)
+                else:
+                    raise Exception("任务结果包含未知图片格式")
+            except Exception as delivery_error:
+                _record_async_task(
+                    "delivery_failed",
+                    task_id=task_id,
+                    status="download_failed",
+                    error=str(delivery_error),
+                    **task_metadata,
                 )
-            elif output.get("type") == "b64":
-                path = save_image_base64_to_output(output.get("value"), context, output_dir, position)
-            else:
-                raise Exception("任务结果包含未知图片格式")
+                raise
             generated_files.append(path)
+            _record_async_task(
+                "delivered",
+                task_id=task_id,
+                status="success",
+                output_path=os.path.abspath(path),
+                output_url=image_url,
+                output_type=output.get("type", ""),
+                **task_metadata,
+            )
             progress(f"第 {index + 1}/{batch_num} 张图片已保存", 86 + int((index + 1) * 14 / batch_num))
 
         print(f"鸭梨 AI 异步任务完成，共保存 {len(generated_files)} 张图片")
