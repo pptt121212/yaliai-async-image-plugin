@@ -88,26 +88,37 @@ class _DownloadSession:
 
 class PluginContractTests(unittest.TestCase):
     def test_reference_images_are_compressed_to_temporary_jpeg(self):
-        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as stage_dir:
+        with tempfile.TemporaryDirectory() as source_dir:
             source_path = Path(source_dir) / "reference.png"
             with Image.new("RGBA", (5000, 3000), (20, 80, 140, 255)) as image:
                 image.save(source_path, "PNG")
+            source_path.write_bytes(source_path.read_bytes() + b"x" * (6 * 1024 * 1024))
             original_size = source_path.stat().st_size
 
             prepared, cleanup = plugin._prepare_reference_images(
-                {0: str(source_path)}, {"reference_image_target_mb": 1}
+                {0: str(source_path)}, {}
             )
             try:
                 prepared_path = Path(prepared[0])
                 self.assertNotEqual(prepared_path, source_path)
                 self.assertEqual(prepared_path.suffix, ".jpg")
-                self.assertLess(prepared_path.stat().st_size, 1024 * 1024)
+                self.assertLess(prepared_path.stat().st_size, 5 * 1024 * 1024)
                 self.assertEqual(source_path.stat().st_size, original_size)
                 with Image.open(prepared_path) as image:
                     self.assertEqual(image.size, (4096, 2458))
             finally:
                 cleanup()
             self.assertFalse(prepared_path.exists())
+
+    def test_reference_images_at_or_below_five_mb_are_not_reencoded(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            source_path = Path(source_dir) / "small.png"
+            source_path.write_bytes(base64.b64decode(PNG_1X1))
+            prepared, cleanup = plugin._prepare_reference_images({0: str(source_path)}, {})
+            try:
+                self.assertEqual(prepared[0], str(source_path))
+            finally:
+                cleanup()
 
     def test_large_reference_is_compressed_instead_of_rejected(self):
         with tempfile.TemporaryDirectory() as source_dir:

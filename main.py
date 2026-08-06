@@ -135,9 +135,6 @@ _default_params = {
     "generation_mode": "default",
     "upscale_model": "gemini-3-pro-image-preview",
     "upscale_prompt": _DEFAULT_UPSCALE_PROMPT,
-    # Mirrors the free-image page's 10 MB input guard and approximately 2 MB
-    # upload target, while keeping the value adjustable for constrained hosts.
-    "reference_image_target_mb": 2,
 }
 
 # These are execution guarantees, not end-user tuning knobs. A gateway image
@@ -164,7 +161,8 @@ _RETIRED_PARAM_KEYS = {
 _REFERENCE_IMAGE_MAX_LONG_EDGE = 4096
 _REFERENCE_IMAGE_MAX_PIXELS = 16 * 1000 * 1000
 _REFERENCE_IMAGE_MIN_LONG_EDGE = 320
-_REFERENCE_IMAGE_TARGET_OPTIONS_MB = (1, 2, 4, 8)
+_REFERENCE_IMAGE_THRESHOLD_BYTES = 5 * 1024 * 1024
+_REFERENCE_IMAGE_TARGET_BYTES = _REFERENCE_IMAGE_THRESHOLD_BYTES - 1
 
 
 class _FifoGate:
@@ -200,6 +198,7 @@ class _FifoGate:
 _local_task_gate = _FifoGate(_LOCAL_MAX_ACTIVE_TASKS)
 _local_reference_gate = _FifoGate(_LOCAL_MAX_REFERENCE_TASKS)
 _local_delivery_gate = _FifoGate(_LOCAL_MAX_DELIVERY_TASKS)
+_local_reference_compression_gate = _FifoGate(1)
 
 
 def _ensure_config_exists():
@@ -463,10 +462,8 @@ def _collect_valid_reference_images(reference_images, max_images=8):
 
 
 def _reference_target_bytes(params):
-    value = _safe_int((params or {}).get("reference_image_target_mb", 2), 2)
-    if value not in _REFERENCE_IMAGE_TARGET_OPTIONS_MB:
-        value = 2
-    return value * 1024 * 1024
+    del params
+    return _REFERENCE_IMAGE_TARGET_BYTES
 
 
 def _encode_reference_jpeg(image, quality):
@@ -494,11 +491,13 @@ def _compress_reference_file(path, staging_dir, target_bytes):
     source_size = os.path.getsize(path)
     if source_size <= 0:
         raise Exception(f"参考图为空文件: {os.path.basename(path)}")
+    if source_size <= _REFERENCE_IMAGE_THRESHOLD_BYTES:
+        return path
+
     with Image.open(path) as opened:
         image = ImageOps.exif_transpose(opened)
         image.load()
         width, height = image.size
-        source_format = str(opened.format or "").upper()
         if width < 1 or height < 1:
             raise Exception(f"参考图尺寸无效: {os.path.basename(path)}")
 
@@ -506,12 +505,6 @@ def _compress_reference_file(path, staging_dir, target_bytes):
             max(width, height) > _REFERENCE_IMAGE_MAX_LONG_EDGE
             or width * height > _REFERENCE_IMAGE_MAX_PIXELS
         )
-        # Keep an already-small JPEG untouched; other formats are converted so
-        # OpenAI multipart and Gemini inlineData receive one predictable image
-        # representation.
-        if source_size <= target_bytes and not needs_resize and source_format in {"JPEG", "JPG"}:
-            return path
-
         current_width, current_height = width, height
         if needs_resize:
             scale = min(1.0, _REFERENCE_IMAGE_MAX_LONG_EDGE / max(width, height))
@@ -545,7 +538,7 @@ def _compress_reference_file(path, staging_dir, target_bytes):
             current_width = max(1, int(current_width * 0.86))
             current_height = max(1, int(current_height * 0.86))
 
-    if not best:
+    if not best or len(best) > target_bytes:
         raise Exception(f"参考图压缩失败: {os.path.basename(path)}")
 
     output_path = os.path.join(
@@ -557,7 +550,7 @@ def _compress_reference_file(path, staging_dir, target_bytes):
     return output_path
 
 
-def _prepare_reference_images(reference_images, params):
+def _prepare_reference_images(reference_images, params, is_cancelled=lambda: False):
     """Prepare local references once and return (mapping, cleanup callback)."""
     normalized = _normalize_reference_images(reference_images)
     if not normalized:
@@ -574,29 +567,31 @@ def _prepare_reference_images(reference_images, params):
     if not local_paths:
         return normalized, lambda: None
 
-    # Prepared JPEGs are reused by every concurrent storyboard item. Avoid
-    # creating a throwaway staging directory for each stage when no work is
-    # needed.
+    # Prepared references are reused by every concurrent storyboard item. Do
+    # not create a staging directory when every source is within the limit.
     if all(
-        os.path.splitext(path)[1].lower() in {".jpg", ".jpeg"}
-        and os.path.getsize(path) <= target_bytes
+        os.path.getsize(path) <= _REFERENCE_IMAGE_THRESHOLD_BYTES
         for path in local_paths
     ):
         return normalized, lambda: None
 
-    staging_dir = tempfile.mkdtemp(prefix="yaliai-reference-")
-    prepared = dict(normalized)
+    _local_reference_compression_gate.acquire(is_cancelled)
     try:
-        for position, value in normalized.items():
-            text = str(value or "").strip()
-            if not text or text.lower().startswith(("http://", "https://")):
-                continue
-            if os.path.exists(text) and os.path.getsize(text) > 0:
-                prepared[position] = _compress_reference_file(text, staging_dir, target_bytes)
-    except Exception:
-        import shutil
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        raise
+        staging_dir = tempfile.mkdtemp(prefix="yaliai-reference-")
+        prepared = dict(normalized)
+        try:
+            for position, value in normalized.items():
+                text = str(value or "").strip()
+                if not text or text.lower().startswith(("http://", "https://")):
+                    continue
+                if os.path.exists(text) and os.path.getsize(text) > 0:
+                    prepared[position] = _compress_reference_file(text, staging_dir, target_bytes)
+        except Exception:
+            import shutil
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+    finally:
+        _local_reference_compression_gate.release()
 
     def cleanup():
         import shutil
@@ -2243,7 +2238,9 @@ def generate(context):
             if is_cancelled():
                 raise Exception("任务已被宿主取消")
             progress("生成中", start_percent)
-            prepared_references, cleanup_stage_references = _prepare_reference_images(stage_references, params)
+            prepared_references, cleanup_stage_references = _prepare_reference_images(
+                stage_references, params, is_cancelled=is_cancelled
+            )
             try:
                 if stage_model in GPT_IMAGE_MODELS:
                     outputs = send_gpt_image_request(
