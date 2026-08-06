@@ -214,6 +214,48 @@ class PluginContractTests(unittest.TestCase):
         ])
         self.assertEqual(calls[1][2].keys(), {0})
 
+    def test_batch_upscale_keeps_each_storyboard_stage_order_and_output_order(self):
+        events = []
+        events_lock = threading.Lock()
+
+        def fake_gemini(**kwargs):
+            stage = "upscale" if kwargs["reference_images"] else "source"
+            with events_lock:
+                events.append((stage, kwargs["request_id"]))
+            return [{"type": "b64", "value": PNG_1X1, "task_id": kwargs["request_id"]}]
+
+        with tempfile.TemporaryDirectory() as output_dir, patch.object(
+            plugin, "send_gemini_request", side_effect=fake_gemini
+        ):
+            paths = plugin.generate({
+                "prompt": "batch upscale ordering test",
+                "output_dir": output_dir,
+                "output_position": [9, 2, 7],
+                "batch_num": 3,
+                "plugin_params": {
+                    "gemini_api_key": "test-key",
+                    "model": "gemini-3.1-flash-image-preview",
+                    "generation_mode": "upscale",
+                    "upscale_model": "gemini-3-pro-image-preview",
+                    "upscale_prompt": "enhance {{image_size}} {{aspect_ratio}}",
+                },
+            })
+
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(Path(paths[0]).name.endswith("_9.png"))
+        self.assertTrue(Path(paths[1]).name.endswith("_2.png"))
+        self.assertTrue(Path(paths[2]).name.endswith("_7.png"))
+        for position in (9, 2, 7):
+            source_index = next(
+                index for index, (stage, request_id) in enumerate(events)
+                if stage == "source" and f"_0_{position}_" in request_id
+            )
+            upscale_index = next(
+                index for index, (stage, request_id) in enumerate(events)
+                if stage == "upscale" and f"_{position}_upscale_" in request_id
+            )
+            self.assertLess(source_index, upscale_index)
+
     def test_upscale_cross_protocol_keeps_semantic_size_for_gemini(self):
         source_calls = []
         upscale_calls = []
