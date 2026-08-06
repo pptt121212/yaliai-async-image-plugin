@@ -12,6 +12,8 @@
     .task-log { margin-top: 14px; }
     .plugin-actions { display: flex; gap: 8px; margin-top: 14px; }
     .upscale-prompt { min-height: 120px; resize: vertical; font-family: inherit; }
+    .upscale-hint { margin: 8px 0 12px; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+    .upscale-hint[hidden] { display: none; }
     .mode-options { display: flex; gap: 6px; }
     .mode-btn {
       flex: 1;
@@ -43,7 +45,7 @@
     <div class="form-control">
       <div class="mode-options" role="group" aria-label="生成模式">
         <button class="mode-btn active" type="button" data-mode="default" aria-pressed="true">默认（单模型）</button>
-        <button class="mode-btn" type="button" data-mode="upscale" aria-pressed="false">超分（A 到 B）</button>
+        <button class="mode-btn" type="button" data-mode="upscale" aria-pressed="false">超分</button>
       </div>
     </div>
   </div>
@@ -58,7 +60,7 @@
   </div>
 
   <div class="form-row" id="upscaleModelRow" hidden>
-    <label class="form-label">超分模型 B</label>
+    <label class="form-label">超分模型</label>
     <div class="form-control"><select id="upscaleModelSelect">
       <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview</option>
       <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
@@ -70,6 +72,8 @@
     <label class="form-label">超分提示词</label>
     <div class="form-control"><textarea class="upscale-prompt" id="upscalePromptInput" placeholder="支持 {{image_size}} 和 {{aspect_ratio}} 变量"></textarea></div>
   </div>
+
+  <p class="upscale-hint" id="upscaleHint" hidden>超分模式会先使用默认模型生成基础图片，再使用超分模型生成最终图片。</p>
 
   <div class="form-row">
     <label class="form-label">画质</label>
@@ -169,6 +173,7 @@
       var enabled = currentGenerationMode === 'upscale'
       document.getElementById('upscaleModelRow').hidden = !enabled
       document.getElementById('upscalePromptRow').hidden = !enabled
+      document.getElementById('upscaleHint').hidden = !enabled
     }
 
     function setGenerationMode(mode, persist) {

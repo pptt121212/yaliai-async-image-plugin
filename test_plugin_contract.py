@@ -339,6 +339,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn('.form-row[hidden] { display: none; }', ui_html)
         self.assertIn('class="mode-btn active"', ui_html)
         self.assertIn('data-mode="upscale"', ui_html)
+        self.assertIn('>超分</button>', ui_html)
+        self.assertIn('>超分模型</label>', ui_html)
+        self.assertIn('先使用默认模型生成基础图片，再使用超分模型生成最终图片', ui_html)
+        self.assertIn('id="upscaleHint" hidden', ui_html)
         self.assertLess(ui_html.index('生成模式'), ui_html.index('id="settingsPanel"'))
         self.assertNotIn('id="generationModeSelect"', ui_html)
 
