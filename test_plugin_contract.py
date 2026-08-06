@@ -171,6 +171,7 @@ class PluginContractTests(unittest.TestCase):
     def test_async_gateway_submit_and_poll_contract(self):
         session = _GatewaySession()
         request_id = "yaliai_plugin_contract_unique"
+        progress_texts = []
         with patch.object(plugin, "_sleep_with_cancel", side_effect=lambda *_: None), \
                 patch.object(plugin, "_record_async_task"):
             accepted = plugin._submit_async_request(
@@ -190,7 +191,7 @@ class PluginContractTests(unittest.TestCase):
                 30,
                 5,
                 60,
-                lambda *_: None,
+                lambda text, *_: progress_texts.append(text),
             )
 
         self.assertEqual(accepted["task_id"], "task-contract-1")
@@ -199,6 +200,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(headers["Idempotency-Key"], request_id)
         self.assertEqual(headers["X-Request-ID"], request_id)
         self.assertEqual(len(session.get_calls), 2)
+        self.assertEqual(progress_texts, ["已提交", "排队中", "下载中"])
+        self.assertTrue(all(len(text) <= 3 for text in progress_texts))
 
     def test_batch_uses_host_positions_and_serial_order(self):
         request_ids = []

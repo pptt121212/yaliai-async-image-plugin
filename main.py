@@ -810,7 +810,7 @@ def _poll_async_task(session, endpoint, api_key, accepted, request_timeout, init
     initial_delay = max(30, int(initial_delay))
     poll_interval = max(1, int(poll_interval))
     max_wait = max(60, int(max_wait))
-    progress(f"已提交任务，等待 {initial_delay} 秒后开始查询", 15)
+    progress("已提交", 15)
     _sleep_with_cancel(initial_delay, is_cancelled)
     deadline = time.monotonic() + max_wait
     poll_count = 0
@@ -849,7 +849,7 @@ def _poll_async_task(session, endpoint, api_key, accepted, request_timeout, init
             )
             for item in outputs:
                 item["task_id"] = task_id
-            progress("任务完成，开始按顺序下载图片", 85)
+            progress("下载中", 85)
             return outputs
         if status in {"failed", "cancelled", "canceled", "expired"}:
             error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
@@ -858,7 +858,7 @@ def _poll_async_task(session, endpoint, api_key, accepted, request_timeout, init
             raise Exception(f"鸭梨 AI 任务{status}: {message}")
 
         elapsed = max_wait - max(0, int(deadline - time.monotonic()))
-        progress(f"任务{status or '处理中'}，已等待 {elapsed} 秒", min(84, 20 + int(elapsed * 60 / max(1, max_wait))))
+        progress("排队中" if status in {"queued", "pending"} else "生成中", min(84, 20 + int(elapsed * 60 / max(1, max_wait))))
         _sleep_with_cancel(poll_interval, is_cancelled)
 
     _record_async_task("timeout", task_id=task_id, status="poll_timeout", poll_count=poll_count)
@@ -1965,7 +1965,7 @@ def generate(context):
                 "reference_image_count": len(_normalize_reference_images(reference_images)),
                 "prompt_preview": _prompt_preview(prompt),
             }
-            progress(f"正在生成第 {index + 1}/{batch_num} 张图片", 10 + int(index * 70 / batch_num))
+            progress("生成中", 10 + int(index * 70 / batch_num))
             if is_cancelled():
                 raise Exception("任务已被宿主取消")
 
@@ -2017,7 +2017,7 @@ def generate(context):
                 print(f"警告：任务返回 {len(outputs)} 张图片；当前宿主槽位只接收第一张")
             output = outputs[0]
             task_id = str(output.get("task_id", "") or "")
-            progress(f"正在下载第 {index + 1}/{batch_num} 张图片", 82 + int(index * 12 / batch_num))
+            progress("下载中", 82 + int(index * 12 / batch_num))
             try:
                 if output.get("type") == "url":
                     image_url = _absolute_gateway_url(endpoint, output.get("value"))
@@ -2056,7 +2056,7 @@ def generate(context):
                 output_type=output.get("type", ""),
                 **task_metadata,
             )
-            progress(f"第 {index + 1}/{batch_num} 张图片已保存", 86 + int((index + 1) * 14 / batch_num))
+            progress("完成", 86 + int((index + 1) * 14 / batch_num))
 
         print(f"鸭梨 AI 异步任务完成，共保存 {len(generated_files)} 张图片")
         return generated_files
