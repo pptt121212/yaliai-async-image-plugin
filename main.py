@@ -3,10 +3,10 @@
 鸭梨 AI 图像生成插件
 
 参数同步：
-- main.py 同级 config.json
+- 首次加载时在 main.py 同级自动创建 config.json
 - 前端 sendAction('save_param') 写入
 - 前端 sendAction('load_params') 读取
-- generate() 时以 config.json 为最高优先级
+- generate() 合并默认值、运行配置和当前宿主调用参数
 
 支持：
 - Yali AI Gateway native Gemini and OpenAI Images endpoints
