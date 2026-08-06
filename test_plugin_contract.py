@@ -98,6 +98,34 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(plugin._api_key_for_model(params, "gpt-image-2"), "gpt-key")
         self.assertEqual(plugin._api_key_for_model(params, "gemini-3.1-flash-image-preview"), "gemini-key")
 
+    def test_legacy_gpt_model_alias_uses_openai_images_branch(self):
+        self.assertEqual(plugin._normalize_model("gpt-image2-Pro"), "gpt-image-2")
+        self.assertEqual(plugin._normalize_model("openai-image-2"), "gpt-image-2")
+        self.assertEqual(plugin._normalize_model("gpt-image-2"), "gpt-image-2")
+
+        session = _Session()
+        with tempfile.TemporaryDirectory() as output_dir, \
+                patch.object(plugin, "_new_http_session", return_value=session), \
+                patch.object(plugin, "send_gpt_image_request", return_value=[{"type": "b64", "value": PNG_1X1}]) as send_gpt, \
+                patch.object(plugin, "send_gemini_request") as send_gemini:
+            plugin.generate({
+                "prompt": "alias branch test",
+                "output_dir": output_dir,
+                "plugin_params": {
+                    "model": "gpt-image2-Pro",
+                    "gpt_api_key": "gpt-key",
+                    "gemini_api_key": "gemini-key",
+                    "endpoint": "http://gateway.invalid",
+                    "aspect_ratio": "16:9",
+                    "image_size": "4K",
+                    "quality": "medium",
+                },
+            })
+        send_gpt.assert_called_once()
+        self.assertEqual(send_gpt.call_args.kwargs["model"], "gpt-image-2")
+        self.assertEqual(send_gpt.call_args.kwargs["api_key"], "gpt-key")
+        send_gemini.assert_not_called()
+
     def test_task_log_popup_groups_events_and_can_clear(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"

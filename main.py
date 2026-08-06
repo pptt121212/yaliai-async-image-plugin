@@ -72,6 +72,10 @@ def _save_config(params):
     if not isinstance(params, dict):
         return False
 
+    params = dict(params)
+    if "model" in params:
+        params["model"] = _normalize_model(params.get("model"))
+
     with _config_lock:
         try:
             existing = {}
@@ -157,6 +161,9 @@ def _ensure_config_exists():
     for key, value in _default_params.items():
         if key not in current:
             migration[key] = value
+    normalized_model = _normalize_model(current.get("model"))
+    if current.get("model") != normalized_model:
+        migration["model"] = normalized_model
     if migration or any(key in current for key in _RETIRED_PARAM_KEYS):
         _save_config(migration)
 
@@ -311,6 +318,12 @@ def _normalize_model(model):
     if not model:
         return _default_params["model"]
 
+    compact = re.sub(r"[^a-z0-9]", "", model.lower())
+    # Older tool settings used names such as gpt-image2-Pro. They are still
+    # OpenAI Images selections and must never enter the Gemini endpoint branch.
+    if compact.startswith("gptimage2") or compact.startswith("openaiimage"):
+        return "gpt-image-2"
+
     return model
 
 
@@ -387,6 +400,8 @@ def _merge_runtime_params(context):
     if isinstance(ctx_params, dict):
         merged.update(_clean_empty_credentials(ctx_params))
 
+    merged["model"] = _normalize_model(merged.get("model"))
+
     try:
         print("[Yali AI Image][PARAM_SRC]")
         print(f"  _global_params.model = {_global_params.get('model')}")
@@ -402,6 +417,7 @@ def _merge_runtime_params(context):
 def get_params():
     params = _default_params.copy()
     params.update(_clean_empty_credentials(_load_config()))
+    params["model"] = _normalize_model(params.get("model"))
     return params
 
 
@@ -425,6 +441,8 @@ def load_params(params):
 
     if isinstance(params, dict):
         params = _clean_empty_credentials(params)
+        if "model" in params:
+            params["model"] = _normalize_model(params.get("model"))
         _global_params.update(params)
 
     print("[Yali AI Image] load_params 已更新内存参数")
@@ -449,6 +467,8 @@ def handle_action(action, data=None):
         ok = _save_single_param(key, value)
 
         if ok:
+            if key == "model":
+                value = _normalize_model(value)
             _global_params[key] = value
 
         return {"ok": ok}
@@ -462,6 +482,9 @@ def handle_action(action, data=None):
         ok = _save_config(params)
 
         if ok:
+            if "model" in params:
+                params = dict(params)
+                params["model"] = _normalize_model(params.get("model"))
             _global_params.update(params)
 
         return {"ok": ok}
