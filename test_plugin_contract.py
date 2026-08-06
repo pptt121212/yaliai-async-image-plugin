@@ -91,6 +91,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(plugin._default_params["aspect_ratio"], "16:9")
         self.assertEqual(plugin.build_gpt_image_size("16:9", "4K"), "3840x2160")
 
+    def test_async_polling_uses_a_short_bounded_interval(self):
+        self.assertEqual(plugin._ASYNC_INITIAL_DELAY_SECONDS, 20)
+        self.assertEqual(plugin._ASYNC_POLL_INTERVAL_SECONDS, 2)
+
     def test_model_family_uses_its_own_credential(self):
         params = {
             "gpt_api_key": "gpt-key",
