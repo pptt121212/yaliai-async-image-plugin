@@ -17,7 +17,6 @@
     th { position: sticky; top: 0; background: var(--bg-primary); text-align: left; white-space: nowrap; }
     td, th { padding: 7px 8px; border-bottom: 1px solid var(--border-color); vertical-align: top; font-size: 12px; }
     .task-id { width: 132px; max-width: 132px; font-family: monospace; white-space: normal; overflow-wrap: anywhere; word-break: break-all; }
-    .panel, th:nth-child(2) { display: none; }
     .model { min-width: 230px; }
     .time { white-space: nowrap; }
     .status { white-space: nowrap; }
@@ -57,7 +56,6 @@
       <thead>
         <tr>
           <th>任务 ID</th>
-          <th>分镜 / 输出</th>
           <th>模型与参数</th>
           <th>状态</th>
           <th>更新时间</th>
@@ -138,14 +136,12 @@
           return '<a href="' + esc(url) + '" target="_blank" rel="noreferrer">打开图片 URL</a>'
         }).join('')
         var result = image + links + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
-        var panel = '序号 ' + esc(task.viewer_index || '-') + '<br>槽位 ' + esc(task.output_position || '-') + '<br>' + esc(task.unique_name || '-')
         var stage = task.pipeline_stage === 'source' ? 'A 中间' : (task.pipeline_stage === 'upscale' ? 'B 最终' : '单阶段')
         var settings = esc(stage) + '<br>' + esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
-        var mode = task.generation_mode === 'upscale' ? '瓒呭垎' : '榛樿'
+        var mode = task.generation_mode === 'upscale' ? '超分' : '默认'
         settings = esc(mode) + '<br>' + settings
         row.innerHTML =
           '<td class="task-id">' + esc(task.task_id) + '</td>' +
-          '<td class="panel">' + panel + '</td>' +
           '<td class="model">' + settings + '</td>' +
           '<td class="status">' + esc(task.status || task.event || '-') + '<br>事件 ' + esc(task.event_count || 0) + '</td>' +
           '<td class="time">' + esc(formatTime(task.updated_at)) + '</td>' +

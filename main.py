@@ -216,6 +216,11 @@ def _ensure_config_exists():
     normalized_model = _normalize_model(current.get("model"))
     if current.get("model") != normalized_model:
         migration["model"] = normalized_model
+    if (
+        str(current.get("generation_mode", "default") or "default").strip().lower() == "default"
+        and _normalize_model(current.get("upscale_model")) == "gpt-image-2"
+    ):
+        migration["upscale_model"] = "gemini-3-pro-image-preview"
     if migration or any(key in current for key in _RETIRED_PARAM_KEYS):
         _save_config(migration)
 

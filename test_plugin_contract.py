@@ -257,6 +257,9 @@ class PluginContractTests(unittest.TestCase):
         send_gemini.assert_not_called()
 
     def test_task_log_popup_groups_events_and_can_clear(self):
+        task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
+        self.assertNotIn("分镜 / 输出", task_log_html)
+        self.assertIn("generation_mode === 'upscale' ? '超分' : '默认'", task_log_html)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"
         ):
