@@ -139,7 +139,8 @@
         }).join('')
         var result = image + links + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
         var panel = '序号 ' + esc(task.viewer_index || '-') + '<br>槽位 ' + esc(task.output_position || '-') + '<br>' + esc(task.unique_name || '-')
-        var settings = esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
+        var stage = task.pipeline_stage === 'source' ? 'A 中间' : (task.pipeline_stage === 'upscale' ? 'B 最终' : '单阶段')
+        var settings = esc(stage) + '<br>' + esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
         var trace = esc(task.trace_id || '-') + '<br>' + esc(task.request_id || '-')
         row.innerHTML =
           '<td class="task-id">' + esc(task.task_id) + '</td>' +

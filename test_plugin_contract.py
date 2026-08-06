@@ -95,6 +95,14 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(plugin._ASYNC_INITIAL_DELAY_SECONDS, 20)
         self.assertEqual(plugin._ASYNC_POLL_INTERVAL_SECONDS, 2)
 
+    def test_upscale_prompt_replaces_size_and_ratio_variables(self):
+        prompt = plugin._render_upscale_prompt(
+            "target {{image_size}} / {{aspect_ratio}} and {image_size} / {aspect_ratio}",
+            "4K",
+            "16:9",
+        )
+        self.assertEqual(prompt, "target 4K / 16:9 and 4K / 16:9")
+
     def test_model_family_uses_its_own_credential(self):
         params = {
             "gpt_api_key": "gpt-key",
@@ -117,6 +125,70 @@ class PluginContractTests(unittest.TestCase):
                 },
             })
         self.assertEqual(submit.call_args.kwargs["endpoint"], "https://api.yaliai.com")
+
+    def test_upscale_mode_runs_source_then_upscale_and_returns_only_final_file(self):
+        stage_order = []
+        upscale_reference_paths = []
+        final_file_exists = False
+
+        def fake_source(**_kwargs):
+            stage_order.append("source")
+            return [{"type": "b64", "value": PNG_1X1, "task_id": "source-task"}]
+
+        def fake_upscale(**kwargs):
+            stage_order.append("upscale")
+            reference_path = kwargs["reference_images"][0]
+            upscale_reference_paths.append(reference_path)
+            self.assertTrue(Path(reference_path).exists())
+            self.assertIn("4K", kwargs["prompt"])
+            self.assertIn("16:9", kwargs["prompt"])
+            self.assertNotIn("{{image_size}}", kwargs["prompt"])
+            return [{"type": "b64", "value": PNG_1X1, "task_id": "upscale-task"}]
+
+        with tempfile.TemporaryDirectory() as output_dir, \
+                patch.object(plugin, "send_gemini_request", side_effect=fake_source), \
+                patch.object(plugin, "send_gpt_image_request", side_effect=fake_upscale), \
+                patch.object(plugin, "_record_async_task"):
+            paths = plugin.generate({
+                "prompt": "source prompt",
+                "output_dir": output_dir,
+                "output_position": [3],
+                "plugin_params": {
+                    "gemini_api_key": "source-key",
+                    "gpt_api_key": "upscale-key",
+                    "model": "gemini-3.1-flash-image-preview",
+                    "generation_mode": "upscale",
+                    "upscale_model": "gpt-image-2",
+                    "upscale_prompt": "enhance {{image_size}} {{aspect_ratio}}",
+                    "image_size": "4K",
+                    "aspect_ratio": "16:9",
+                    "quality": "medium",
+                },
+            })
+            final_file_exists = Path(paths[0]).exists()
+
+        self.assertEqual(stage_order, ["source", "upscale"])
+        self.assertEqual(len(upscale_reference_paths), 1)
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(final_file_exists)
+        self.assertFalse(Path(upscale_reference_paths[0]).exists())
+
+    def test_upscale_mode_validates_second_model_key_before_source_request(self):
+        with tempfile.TemporaryDirectory() as output_dir, patch.object(
+            plugin, "send_gemini_request"
+        ) as source_request:
+            with self.assertRaisesRegex(Exception, "超分模型所需"):
+                plugin.generate({
+                    "prompt": "missing upscale key",
+                    "output_dir": output_dir,
+                    "plugin_params": {
+                        "gemini_api_key": "source-key",
+                        "model": "gemini-3.1-flash-image-preview",
+                        "generation_mode": "upscale",
+                        "upscale_model": "gpt-image-2",
+                    },
+                })
+        source_request.assert_not_called()
 
     def test_legacy_gpt_model_alias_uses_openai_images_branch(self):
         self.assertEqual(plugin._normalize_model("gpt-image2-Pro"), "gpt-image-2")

@@ -10,6 +10,7 @@
     .api-key-wrapper input { flex: 1; padding-right: 36px; }
     .toggle-eye { position: absolute; right: 8px; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; padding: 2px 4px; }
     .task-log { margin-top: 14px; }
+    .upscale-prompt { min-height: 120px; resize: vertical; font-family: inherit; }
   </style>
 </head>
 <body>
@@ -43,6 +44,28 @@
       <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
       <option value="gpt-image-2">gpt-image-2</option>
     </select></div>
+  </div>
+
+  <div class="form-row">
+    <label class="form-label">生成模式</label>
+    <div class="form-control"><select id="generationModeSelect">
+      <option value="default">默认（单模型）</option>
+      <option value="upscale">超分（A 到 B）</option>
+    </select></div>
+  </div>
+
+  <div class="form-row" id="upscaleModelRow" hidden>
+    <label class="form-label">超分模型 B</label>
+    <div class="form-control"><select id="upscaleModelSelect">
+      <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview</option>
+      <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
+      <option value="gpt-image-2">gpt-image-2</option>
+    </select></div>
+  </div>
+
+  <div class="form-row" id="upscalePromptRow" hidden>
+    <label class="form-label">超分提示词</label>
+    <div class="form-control"><textarea class="upscale-prompt" id="upscalePromptInput" placeholder="支持 {{image_size}} 和 {{aspect_ratio}} 变量"></textarea></div>
   </div>
 
   <div class="form-row">
@@ -89,17 +112,29 @@
       model: 'gemini-3.1-flash-image-preview',
       aspect_ratio: '16:9',
       image_size: '4K',
-      quality: 'medium'
+      quality: 'medium',
+      generation_mode: 'default',
+      upscale_model: 'gpt-image-2',
+      upscale_prompt: '现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。请将图像精细度和文字边缘细节提升至 {{image_size}} 电影级分辨率。场景清晰不允许存在锯齿和噪点，颜色纯净。请在画面中原地追加细节。保持图像 {{aspect_ratio}} 比例，不要因为限制图像比例而使用变形的素材和文字。图像比例不对将判定为任务失败！'
     }
     var fields = {
       gpt_api_key: document.getElementById('gptApiKeyInput'),
       gemini_api_key: document.getElementById('geminiApiKeyInput'),
       model: document.getElementById('modelSelect'),
+      generation_mode: document.getElementById('generationModeSelect'),
+      upscale_model: document.getElementById('upscaleModelSelect'),
+      upscale_prompt: document.getElementById('upscalePromptInput'),
       quality: document.getElementById('qualitySelect'),
       image_size: document.getElementById('imageSizeSelect'),
       aspect_ratio: document.getElementById('aspectRatioSelect')
     }
     var sdkReady = false
+
+    function updateUpscaleVisibility() {
+      var enabled = fields.generation_mode.value === 'upscale'
+      document.getElementById('upscaleModelRow').hidden = !enabled
+      document.getElementById('upscalePromptRow').hidden = !enabled
+    }
 
     function selectValue(element, value) {
       for (var i = 0; i < element.options.length; i++) {
@@ -136,6 +171,7 @@
       } else if (!params.gemini_api_key && params.api_key) {
         fields.gemini_api_key.value = params.api_key
       }
+      updateUpscaleVisibility()
     }
 
     document.querySelectorAll('.toggle-eye').forEach(function (button) {
@@ -145,7 +181,7 @@
         button.textContent = input.type === 'password' ? '显示' : '隐藏'
       })
     })
-    Object.keys(fields).forEach(function (key) { fields[key].addEventListener('change', function () { save(key) }) })
+    Object.keys(fields).forEach(function (key) { fields[key].addEventListener('change', function () { save(key); if (key === 'generation_mode') updateUpscaleVisibility() }) })
     PluginSDK.onAction('load_params', function (result) { if (result && result.ok) applyParams(result.params) })
     document.getElementById('openTaskLog').addEventListener('click', function () {
       if (sdkReady) PluginSDK.sendAction('open_task_logs')

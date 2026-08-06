@@ -53,6 +53,13 @@ _config_lock = threading.Lock()
 _ASYNC_TASK_LOG_PATH = plugin_dir / "async_tasks.jsonl"
 _async_task_log_lock = threading.Lock()
 _GATEWAY_ENDPOINT = "https://api.yaliai.com"
+_DEFAULT_UPSCALE_PROMPT = (
+    "现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。"
+    "请将图像精细度和文字边缘细节提升至 {image_size} 电影级分辨率。"
+    "场景清晰不允许存在锯齿和噪点，颜色纯净。请在画面中原地追加细节。"
+    "保持图像 {aspect_ratio} 比例，不要因为限制图像比例而使用变形的素材和文字。"
+    "图像比例不对将判定为任务失败！"
+)
 
 
 def _load_config():
@@ -124,6 +131,9 @@ _default_params = {
     "aspect_ratio": "16:9",
     "image_size": "4K",
     "quality": "medium",
+    "generation_mode": "default",
+    "upscale_model": "gpt-image-2",
+    "upscale_prompt": _DEFAULT_UPSCALE_PROMPT,
 }
 
 # These are execution guarantees, not end-user tuning knobs. A gateway image
@@ -342,6 +352,21 @@ def _prompt_preview(value, limit=120):
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+def _render_upscale_prompt(template, image_size, aspect_ratio):
+    text = str(template or _DEFAULT_UPSCALE_PROMPT).strip()
+    if not text:
+        raise Exception("PLUGIN_ERROR:::超分提示词不能为空")
+    replacements = {
+        "{{image_size}}": str(image_size),
+        "{image_size}": str(image_size),
+        "{{aspect_ratio}}": str(aspect_ratio),
+        "{aspect_ratio}": str(aspect_ratio),
+    }
+    for placeholder, value in replacements.items():
+        text = text.replace(placeholder, value)
+    return text
 
 
 def _normalize_endpoint(endpoint):
@@ -618,6 +643,10 @@ def _summarize_async_task_events(events):
             "aspect_ratio": "",
             "request_size": "",
             "protocol": "",
+            "generation_mode": "default",
+            "pipeline_stage": "",
+            "source_model": "",
+            "source_task_id": "",
             "viewer_index": 0,
             "unique_name": "",
             "generation_round": 0,
@@ -633,7 +662,8 @@ def _summarize_async_task_events(events):
         summary["event"] = str(event.get("event", "") or summary["event"])
         for key in (
             "status", "error", "trace_id", "request_id", "query_path", "output_path", "output_type",
-            "model", "quality", "image_size", "aspect_ratio", "request_size", "protocol", "viewer_index", "unique_name",
+            "model", "quality", "image_size", "aspect_ratio", "request_size", "protocol", "generation_mode", "pipeline_stage",
+            "source_model", "source_task_id", "viewer_index", "unique_name",
             "generation_round", "output_position", "batch_index", "batch_num", "reference_image_count", "prompt_preview",
         ):
             if event.get(key) not in (None, ""):
@@ -1931,6 +1961,11 @@ def generate(context):
     aspect_ratio = str(params.get("aspect_ratio", "16:9") or "16:9").strip()
     image_size = str(params.get("image_size", "4K") or "4K").strip().upper()
     quality = str(params.get("quality", "medium") or "medium").strip().lower()
+    generation_mode = str(params.get("generation_mode", "default") or "default").strip().lower()
+    upscale_model = _normalize_model(params.get("upscale_model", "gpt-image-2"))
+    upscale_prompt_template = str(
+        params.get("upscale_prompt", _DEFAULT_UPSCALE_PROMPT) or _DEFAULT_UPSCALE_PROMPT
+    ).strip()
     request_timeout = _GATEWAY_HTTP_TIMEOUT_SECONDS
     download_timeout = _IMAGE_DOWNLOAD_TIMEOUT_SECONDS
     initial_delay = _ASYNC_INITIAL_DELAY_SECONDS
@@ -1954,6 +1989,13 @@ def generate(context):
         raise Exception("PLUGIN_ERROR:::未提供输出目录 output_dir/project_path")
     if quality not in {"low", "medium", "high"}:
         raise Exception("PLUGIN_ERROR:::画质必须是 low、medium 或 high")
+    if generation_mode not in {"default", "upscale"}:
+        raise Exception("PLUGIN_ERROR:::生成模式必须是 default 或 upscale")
+    if generation_mode == "upscale":
+        if not _api_key_for_model(params, upscale_model):
+            credential_label = "GPT-image-2 API Key" if upscale_model in GPT_IMAGE_MODELS else "Gemini API Key"
+            raise Exception(f"PLUGIN_ERROR:::未设置超分模型所需的 {credential_label}")
+        _render_upscale_prompt(upscale_prompt_template, image_size, aspect_ratio)
 
     os.makedirs(output_dir, exist_ok=True)
     progress_callback = context.get("progress_callback")
@@ -1997,15 +2039,28 @@ def generate(context):
 
     reference_image_count = len(_normalize_reference_images(reference_images))
 
+    def stage_progress(start_percent, end_percent):
+        def callback(text, percent=None):
+            if percent is None:
+                progress(text)
+                return
+            ratio = max(0, min(100, int(percent))) / 100
+            progress(text, int(start_percent + (end_percent - start_percent) * ratio))
+
+        return callback
+
     def execute_one(index):
         position = output_positions[index] if index < len(output_positions) else index
-        request_id = _new_request_id(context, position)
-        task_metadata = {
+        source_task_metadata = {
             "model": model,
             "quality": quality,
             "image_size": image_size,
             "aspect_ratio": aspect_ratio,
             "protocol": "openai_image" if model in GPT_IMAGE_MODELS else "gemini",
+            "generation_mode": generation_mode,
+            "pipeline_stage": "source" if generation_mode == "upscale" else "single",
+            "source_model": model if generation_mode == "upscale" else "",
+            "source_task_id": "",
             "viewer_index": _safe_int(context.get("viewer_index", 0), 0),
             "unique_name": str(context.get("unique_name", "") or ""),
             "generation_round": _safe_int(context.get("generation_round", 0), 0),
@@ -2015,101 +2070,173 @@ def generate(context):
             "reference_image_count": reference_image_count,
             "prompt_preview": _prompt_preview(prompt),
         }
-        progress("生成中", 10 + int(index * 70 / batch_num))
         if is_cancelled():
             raise Exception("任务已被宿主取消")
 
-        if model in GPT_IMAGE_MODELS:
-            outputs = send_gpt_image_request(
-                api_key=api_key,
-                endpoint=endpoint,
-                model=model,
-                prompt=prompt,
-                reference_images=reference_images,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                quality=quality,
-                request_timeout=request_timeout,
-                download_timeout=download_timeout,
-                async_initial_delay=initial_delay,
-                async_poll_interval=poll_interval,
-                async_max_wait=max_wait,
-                progress=progress,
-                request_id=request_id,
-                is_cancelled=is_cancelled,
-                task_metadata=task_metadata,
+        def request_stage(stage_model, stage_prompt, stage_references, stage_request_id, stage_metadata, start_percent, end_percent):
+            if is_cancelled():
+                raise Exception("任务已被宿主取消")
+            progress("生成中", start_percent)
+            if stage_model in GPT_IMAGE_MODELS:
+                outputs = send_gpt_image_request(
+                    api_key=_api_key_for_model(params, stage_model),
+                    endpoint=endpoint,
+                    model=stage_model,
+                    prompt=stage_prompt,
+                    reference_images=stage_references,
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                    quality=quality,
+                    request_timeout=request_timeout,
+                    download_timeout=download_timeout,
+                    async_initial_delay=initial_delay,
+                    async_poll_interval=poll_interval,
+                    async_max_wait=max_wait,
+                    progress=stage_progress(start_percent, end_percent),
+                    request_id=stage_request_id,
+                    is_cancelled=is_cancelled,
+                    task_metadata=stage_metadata,
+                )
+            else:
+                outputs = send_gemini_request(
+                    api_key=_api_key_for_model(params, stage_model),
+                    endpoint=endpoint,
+                    model=stage_model,
+                    prompt=stage_prompt,
+                    reference_images=stage_references,
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                    request_timeout=request_timeout,
+                    download_timeout=download_timeout,
+                    async_initial_delay=initial_delay,
+                    async_poll_interval=poll_interval,
+                    async_max_wait=max_wait,
+                    progress=stage_progress(start_percent, end_percent),
+                    request_id=stage_request_id,
+                    is_cancelled=is_cancelled,
+                    task_metadata=stage_metadata,
+                )
+            if not outputs:
+                raise Exception(f"第 {index + 1} 个鸭梨 AI 任务完成但没有图片输出")
+            if len(outputs) > 1:
+                print(f"警告：任务返回 {len(outputs)} 张图片；当前宿主槽位只接收第一张")
+            return outputs[0]
+
+        def deliver_stage(output, target_dir, event_name, stage_metadata, target_position):
+            task_id = str(output.get("task_id", "") or "")
+            image_url = ""
+            delivery_slot = False
+            progress("下载中")
+            try:
+                _local_delivery_gate.acquire(is_cancelled)
+                delivery_slot = True
+                if output.get("type") == "url":
+                    image_url = _absolute_gateway_url(endpoint, output.get("value"))
+                    if not image_url:
+                        raise Exception("任务结果缺少图片 URL")
+                    path = download_url_to_output(
+                        image_url,
+                        context,
+                        target_dir,
+                        download_timeout=download_timeout,
+                        position_override=target_position,
+                        is_cancelled=is_cancelled,
+                    )
+                elif output.get("type") == "b64":
+                    path = save_image_base64_to_output(output.get("value"), context, target_dir, target_position)
+                else:
+                    raise Exception("任务结果包含未知图片格式")
+            except Exception as delivery_error:
+                _record_async_task(
+                    "delivery_failed",
+                    task_id=task_id,
+                    status="download_failed",
+                    error=str(delivery_error),
+                    **stage_metadata,
+                )
+                raise
+            finally:
+                if delivery_slot:
+                    _local_delivery_gate.release()
+            _record_async_task(
+                event_name,
+                task_id=task_id,
+                status="success" if event_name == "delivered" else "intermediate",
+                output_path=os.path.abspath(path),
+                output_url=image_url,
+                output_type=output.get("type", ""),
+                **stage_metadata,
             )
+            return path, task_id
+
+        if generation_mode == "upscale":
+            with tempfile.TemporaryDirectory(prefix="yaliai-upscale-") as staging_dir:
+                source_output = request_stage(
+                    model,
+                    prompt,
+                    reference_images,
+                    _new_request_id(context, position),
+                    source_task_metadata,
+                    8 + int(index * 35 / batch_num),
+                    42,
+                )
+                source_path, source_task_id = deliver_stage(
+                    source_output,
+                    staging_dir,
+                    "staged",
+                    source_task_metadata,
+                    0,
+                )
+                if is_cancelled():
+                    raise Exception("任务已被宿主取消")
+                progress("生成中", 45)
+                upscale_metadata = dict(source_task_metadata)
+                upscale_metadata.update({
+                    "model": upscale_model,
+                    "protocol": "openai_image" if upscale_model in GPT_IMAGE_MODELS else "gemini",
+                    "pipeline_stage": "upscale",
+                    "source_model": model,
+                    "source_task_id": source_task_id,
+                    "reference_image_count": 1,
+                    "prompt_preview": _prompt_preview(_render_upscale_prompt(
+                        upscale_prompt_template, image_size, aspect_ratio
+                    )),
+                })
+                upscale_output = request_stage(
+                    upscale_model,
+                    _render_upscale_prompt(upscale_prompt_template, image_size, aspect_ratio),
+                    {0: source_path},
+                    _new_request_id(context, f"{position}_upscale"),
+                    upscale_metadata,
+                    45,
+                    92,
+                )
+                final_path, _ = deliver_stage(
+                    upscale_output,
+                    output_dir,
+                    "delivered",
+                    upscale_metadata,
+                    position,
+                )
         else:
-            outputs = send_gemini_request(
-                api_key=api_key,
-                endpoint=endpoint,
-                model=model,
-                prompt=prompt,
-                reference_images=reference_images,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                request_timeout=request_timeout,
-                download_timeout=download_timeout,
-                async_initial_delay=initial_delay,
-                async_poll_interval=poll_interval,
-                async_max_wait=max_wait,
-                progress=progress,
-                request_id=request_id,
-                is_cancelled=is_cancelled,
-                task_metadata=task_metadata,
+            final_path, _ = deliver_stage(
+                request_stage(
+                    model,
+                    prompt,
+                    reference_images,
+                    _new_request_id(context, position),
+                    source_task_metadata,
+                    8 + int(index * 70 / batch_num),
+                    86,
+                ),
+                output_dir,
+                "delivered",
+                source_task_metadata,
+                position,
             )
 
-        if not outputs:
-            raise Exception(f"第 {index + 1} 个鸭梨 AI 任务完成但没有图片输出")
-        if len(outputs) > 1:
-            print(f"警告：任务返回 {len(outputs)} 张图片；当前宿主槽位只接收第一张")
-        output = outputs[0]
-        task_id = str(output.get("task_id", "") or "")
-        progress("下载中", 82 + int(index * 12 / batch_num))
-        image_url = ""
-        delivery_slot = False
-        try:
-            _local_delivery_gate.acquire(is_cancelled)
-            delivery_slot = True
-            if output.get("type") == "url":
-                image_url = _absolute_gateway_url(endpoint, output.get("value"))
-                if not image_url:
-                    raise Exception("任务结果缺少图片 URL")
-                path = download_url_to_output(
-                    image_url,
-                    context,
-                    output_dir,
-                    download_timeout=download_timeout,
-                    position_override=position,
-                    is_cancelled=is_cancelled,
-                )
-            elif output.get("type") == "b64":
-                path = save_image_base64_to_output(output.get("value"), context, output_dir, position)
-            else:
-                raise Exception("任务结果包含未知图片格式")
-        except Exception as delivery_error:
-            _record_async_task(
-                "delivery_failed",
-                task_id=task_id,
-                status="download_failed",
-                error=str(delivery_error),
-                **task_metadata,
-            )
-            raise
-        finally:
-            if delivery_slot:
-                _local_delivery_gate.release()
-        _record_async_task(
-            "delivered",
-            task_id=task_id,
-            status="success",
-            output_path=os.path.abspath(path),
-            output_url=image_url,
-            output_type=output.get("type", ""),
-            **task_metadata,
-        )
         progress("完成", 86 + int((index + 1) * 14 / batch_num))
-        return index, path
+        return index, final_path
 
     def run_one(index):
         reference_slot = False
