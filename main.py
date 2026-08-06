@@ -471,9 +471,14 @@ def _reference_target_bytes(params):
 
 def _encode_reference_jpeg(image, quality):
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        rgba = image.convert("RGBA")
         flattened = Image.new("RGB", image.size, "white")
-        alpha = image.getchannel("A") if "A" in image.getbands() else None
-        flattened.paste(image.convert("RGB"), mask=alpha)
+        rgb = rgba.convert("RGB")
+        alpha = rgba.getchannel("A")
+        flattened.paste(rgb, mask=alpha)
+        rgb.close()
+        alpha.close()
+        rgba.close()
         image = flattened
     else:
         image = image.convert("RGB")
