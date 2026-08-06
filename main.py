@@ -485,7 +485,7 @@ def _encode_reference_jpeg(image, quality):
     return output.getvalue()
 
 
-def _compress_reference_file(path, staging_dir, target_bytes):
+def _compress_reference_file(path, staging_dir, target_bytes, is_cancelled=lambda: False):
     """Create a bounded temporary JPEG without modifying the user's file."""
     path = os.path.abspath(str(path))
     source_size = os.path.getsize(path)
@@ -495,6 +495,13 @@ def _compress_reference_file(path, staging_dir, target_bytes):
         return path
 
     with Image.open(path) as opened:
+        width, height = opened.size
+        # Let decoders that support native downsampling (notably JPEG) avoid
+        # materializing the full source raster before Pillow resizes it.
+        if width * height > _REFERENCE_IMAGE_MAX_PIXELS and hasattr(opened, "draft"):
+            opened.draft("RGB", (_REFERENCE_IMAGE_MAX_LONG_EDGE, _REFERENCE_IMAGE_MAX_LONG_EDGE))
+        if is_cancelled():
+            raise Exception("任务已被宿主取消；参考图压缩已停止")
         image = ImageOps.exif_transpose(opened)
         image.load()
         width, height = image.size
@@ -518,6 +525,8 @@ def _compress_reference_file(path, staging_dir, target_bytes):
         # progressively if the target cannot be reached without distortion.
         qualities = (92, 90, 88, 86, 84, 82, 80, 78, 76, 74, 72)
         for _ in range(9):
+            if is_cancelled():
+                raise Exception("任务已被宿主取消；参考图压缩已停止")
             resampling = getattr(Image, "Resampling", Image).LANCZOS
             candidate_image = image.resize(
                 (current_width, current_height), resampling
@@ -585,7 +594,9 @@ def _prepare_reference_images(reference_images, params, is_cancelled=lambda: Fal
                 if not text or text.lower().startswith(("http://", "https://")):
                     continue
                 if os.path.exists(text) and os.path.getsize(text) > 0:
-                    prepared[position] = _compress_reference_file(text, staging_dir, target_bytes)
+                    prepared[position] = _compress_reference_file(
+                        text, staging_dir, target_bytes, is_cancelled=is_cancelled
+                    )
         except Exception:
             import shutil
             shutil.rmtree(staging_dir, ignore_errors=True)
