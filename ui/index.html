@@ -12,6 +12,7 @@
     .task-log { margin-top: 14px; }
     .plugin-actions { display: flex; gap: 8px; margin-top: 14px; }
     .upscale-prompt { min-height: 120px; resize: vertical; font-family: inherit; }
+    .field-hint { margin-top: 5px; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
     .upscale-hint { margin: 8px 0 12px; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
     .upscale-hint[hidden] { display: none; }
     .mode-options { display: flex; gap: 6px; }
@@ -70,7 +71,10 @@
 
   <div class="form-row" id="upscalePromptRow" hidden>
     <label class="form-label">超分提示词</label>
-    <div class="form-control"><textarea class="upscale-prompt" id="upscalePromptInput" placeholder="支持 {{image_size}} 和 {{aspect_ratio}} 变量"></textarea></div>
+    <div class="form-control">
+      <textarea class="upscale-prompt" id="upscalePromptInput" placeholder="支持 {{image_size}} 和 {{aspect_ratio}} 变量"></textarea>
+      <div class="field-hint">可使用变量：{image_size}（图像档位）和 {aspect_ratio}（图像比例）。</div>
+    </div>
   </div>
 
   <p class="upscale-hint" id="upscaleHint" hidden>超分模式会先使用默认模型生成基础图片，再使用超分模型生成最终图片。</p>
