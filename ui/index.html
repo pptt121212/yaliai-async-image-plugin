@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>鸭梨 AI 图像生成</title>
+  <link rel="stylesheet" href="../../../plugin-sdk.css">
+  <script src="../../../plugin-sdk.js"></script>
+  <style>
+    .api-key-wrapper { position: relative; display: flex; align-items: center; }
+    .api-key-wrapper input { flex: 1; padding-right: 36px; }
+    .toggle-eye { position: absolute; right: 8px; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; padding: 2px 4px; }
+    .task-log { margin-top: 14px; }
+    .task-log pre { max-height: 160px; overflow: auto; white-space: pre-wrap; font-size: 11px; color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <h3>鸭梨 AI 图像生成</h3>
+
+  <div class="form-row">
+    <label class="form-label">GPT-image-2 API Key</label>
+    <div class="form-control"><div class="api-key-wrapper">
+      <input type="password" id="gptApiKeyInput" placeholder="请输入 GPT-image-2 租户 API Key">
+      <button class="toggle-eye" type="button" data-target="gptApiKeyInput" aria-label="显示或隐藏 GPT-image-2 API Key">显示</button>
+    </div></div>
+  </div>
+
+  <div class="form-row">
+    <label class="form-label">Gemini API Key</label>
+    <div class="form-control"><div class="api-key-wrapper">
+      <input type="password" id="geminiApiKeyInput" placeholder="请输入 Gemini 租户 API Key">
+      <button class="toggle-eye" type="button" data-target="geminiApiKeyInput" aria-label="显示或隐藏 Gemini API Key">显示</button>
+    </div></div>
+  </div>
+
+  <div class="form-row">
+    <label class="form-label">鸭梨 AI Gateway 地址</label>
+    <div class="form-control"><input type="text" id="endpointInput" value="https://api.yaliai.com"></div>
+  </div>
+
+  <div class="form-row">
+    <label class="form-label">模型</label>
+    <div class="form-control"><select id="modelSelect">
+      <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview</option>
+      <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
+      <option value="gpt-image-2">gpt-image-2</option>
+    </select></div>
+  </div>
+
+  <div class="form-row">
+    <label class="form-label">画质</label>
+    <div class="form-control"><select id="qualitySelect">
+      <option value="low">低</option>
+      <option value="medium">中</option>
+      <option value="high">高</option>
+    </select></div>
+  </div>
+
+  <div class="form-row">
+    <label class="form-label">图像档位</label>
+    <div class="form-control"><select id="imageSizeSelect">
+      <option value="1K">1K</option>
+      <option value="2K">2K</option>
+      <option value="4K">4K</option>
+    </select></div>
+  </div>
+
+  <div class="form-row">
+    <label class="form-label">图像比例</label>
+    <div class="form-control"><select id="aspectRatioSelect">
+      <option value="auto">自动</option>
+      <option value="1:1">1:1</option>
+      <option value="16:9">16:9</option>
+      <option value="9:16">9:16</option>
+      <option value="4:3">4:3</option>
+      <option value="3:4">3:4</option>
+      <option value="3:2">3:2</option>
+      <option value="2:3">2:3</option>
+      <option value="5:4">5:4</option>
+      <option value="4:5">4:5</option>
+      <option value="21:9">21:9</option>
+    </select></div>
+  </div>
+
+  <div class="task-log">
+    <button id="refreshTaskLog" type="button">查看最近任务</button>
+    <pre id="taskLogOutput" aria-live="polite"></pre>
+  </div>
+
+  <script>
+    var defaults = {
+      endpoint: 'https://api.yaliai.com',
+      model: 'gemini-3.1-flash-image-preview',
+      aspect_ratio: '16:9',
+      image_size: '4K',
+      quality: 'medium'
+    }
+    var fields = {
+      gpt_api_key: document.getElementById('gptApiKeyInput'),
+      gemini_api_key: document.getElementById('geminiApiKeyInput'),
+      endpoint: document.getElementById('endpointInput'),
+      model: document.getElementById('modelSelect'),
+      quality: document.getElementById('qualitySelect'),
+      image_size: document.getElementById('imageSizeSelect'),
+      aspect_ratio: document.getElementById('aspectRatioSelect')
+    }
+    var sdkReady = false
+
+    function selectValue(element, value) {
+      for (var i = 0; i < element.options.length; i++) {
+        if (element.options[i].value === String(value)) {
+          element.selectedIndex = i
+          return true
+        }
+      }
+      return false
+    }
+
+    function save(key) {
+      if (!sdkReady) return
+      var value = String(fields[key].value || '').trim()
+      try { PluginSDK.saveParam(key, value) } catch (error) {}
+      PluginSDK.sendAction('save_param', { key: key, value: value })
+    }
+
+    function applyParams(params) {
+      params = params || {}
+      Object.keys(fields).forEach(function (key) {
+        var value = params[key]
+        if ((value === undefined || value === null || value === '') && defaults[key] !== undefined) value = defaults[key]
+        if (value === undefined || value === null) return
+        if (fields[key].tagName === 'SELECT') selectValue(fields[key], value)
+        else fields[key].value = value
+      })
+      // Read old installations without displaying or saving the legacy field.
+      if (!params.gpt_api_key && !params.gemini_api_key && params.api_key) {
+        fields.gpt_api_key.value = params.api_key
+        fields.gemini_api_key.value = params.api_key
+      } else if (!params.gpt_api_key && params.api_key) {
+        fields.gpt_api_key.value = params.api_key
+      } else if (!params.gemini_api_key && params.api_key) {
+        fields.gemini_api_key.value = params.api_key
+      }
+    }
+
+    document.querySelectorAll('.toggle-eye').forEach(function (button) {
+      button.addEventListener('click', function () {
+        var input = document.getElementById(button.getAttribute('data-target'))
+        input.type = input.type === 'password' ? 'text' : 'password'
+        button.textContent = input.type === 'password' ? '显示' : '隐藏'
+      })
+    })
+    Object.keys(fields).forEach(function (key) { fields[key].addEventListener('change', function () { save(key) }) })
+    PluginSDK.onAction('load_params', function (result) { if (result && result.ok) applyParams(result.params) })
+    PluginSDK.onAction('get_task_logs', function (result) {
+      var output = document.getElementById('taskLogOutput')
+      if (!result || !result.ok) { output.textContent = '任务记录读取失败'; return }
+      output.textContent = (result.tasks || []).map(function (item) {
+        var task = item.task_id || '-'
+        var event = item.event || '-'
+        var status = item.status || '-'
+        var error = item.error ? ' ' + item.error : ''
+        var urls = item.output_urls && item.output_urls.length ? ' ' + item.output_urls.join(' ') : ''
+        return task + '  ' + event + '  ' + status + error + urls
+      }).join('\n') || '暂无任务记录'
+    })
+    document.getElementById('refreshTaskLog').addEventListener('click', function () {
+      if (sdkReady) PluginSDK.sendAction('get_task_logs', { limit: 20 })
+    })
+    PluginSDK.onReady(function (params) {
+      sdkReady = true
+      applyParams(params)
+      PluginSDK.sendAction('load_params')
+    })
+  </script>
+</body>
+</html>
