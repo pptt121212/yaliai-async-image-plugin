@@ -38,7 +38,7 @@ except Exception:
 
 from pathlib import Path
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageOps
 from urllib.parse import urljoin, urlparse
 
 
@@ -135,6 +135,9 @@ _default_params = {
     "generation_mode": "default",
     "upscale_model": "gemini-3-pro-image-preview",
     "upscale_prompt": _DEFAULT_UPSCALE_PROMPT,
+    # Mirrors the free-image page's 10 MB input guard and approximately 2 MB
+    # upload target, while keeping the value adjustable for constrained hosts.
+    "reference_image_target_mb": 2,
 }
 
 # These are execution guarantees, not end-user tuning knobs. A gateway image
@@ -157,6 +160,11 @@ _RETIRED_PARAM_KEYS = {
     "async_max_wait",
     "retry_count",
 }
+
+_REFERENCE_IMAGE_MAX_LONG_EDGE = 4096
+_REFERENCE_IMAGE_MAX_PIXELS = 16 * 1000 * 1000
+_REFERENCE_IMAGE_MIN_LONG_EDGE = 320
+_REFERENCE_IMAGE_TARGET_OPTIONS_MB = (1, 2, 4, 8)
 
 
 class _FifoGate:
@@ -452,6 +460,144 @@ def _collect_valid_reference_images(reference_images, max_images=8):
         "local": local_paths[:max_images],
         "urls": urls[:max_images],
     }
+
+
+def _reference_target_bytes(params):
+    value = _safe_int((params or {}).get("reference_image_target_mb", 2), 2)
+    if value not in _REFERENCE_IMAGE_TARGET_OPTIONS_MB:
+        value = 2
+    return value * 1024 * 1024
+
+
+def _encode_reference_jpeg(image, quality):
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        flattened = Image.new("RGB", image.size, "white")
+        alpha = image.getchannel("A") if "A" in image.getbands() else None
+        flattened.paste(image.convert("RGB"), mask=alpha)
+        image = flattened
+    else:
+        image = image.convert("RGB")
+
+    output = BytesIO()
+    image.save(output, "JPEG", quality=quality, optimize=True, progressive=True)
+    return output.getvalue()
+
+
+def _compress_reference_file(path, staging_dir, target_bytes):
+    """Create a bounded temporary JPEG without modifying the user's file."""
+    path = os.path.abspath(str(path))
+    source_size = os.path.getsize(path)
+    if source_size <= 0:
+        raise Exception(f"参考图为空文件: {os.path.basename(path)}")
+    with Image.open(path) as opened:
+        image = ImageOps.exif_transpose(opened)
+        image.load()
+        width, height = image.size
+        source_format = str(opened.format or "").upper()
+        if width < 1 or height < 1:
+            raise Exception(f"参考图尺寸无效: {os.path.basename(path)}")
+
+        needs_resize = (
+            max(width, height) > _REFERENCE_IMAGE_MAX_LONG_EDGE
+            or width * height > _REFERENCE_IMAGE_MAX_PIXELS
+        )
+        # Keep an already-small JPEG untouched; other formats are converted so
+        # OpenAI multipart and Gemini inlineData receive one predictable image
+        # representation.
+        if source_size <= target_bytes and not needs_resize and source_format in {"JPEG", "JPG"}:
+            return path
+
+        current_width, current_height = width, height
+        if needs_resize:
+            scale = min(1.0, _REFERENCE_IMAGE_MAX_LONG_EDGE / max(width, height))
+            if width * height > _REFERENCE_IMAGE_MAX_PIXELS:
+                scale = min(scale, (_REFERENCE_IMAGE_MAX_PIXELS / (width * height)) ** 0.5)
+            current_width = max(1, int(round(width * scale)))
+            current_height = max(1, int(round(height * scale)))
+
+        best = None
+        # The browser implementation tries quality first, then scales down
+        # progressively if the target cannot be reached without distortion.
+        qualities = (92, 90, 88, 86, 84, 82, 80, 78, 76, 74, 72)
+        for _ in range(9):
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            candidate_image = image.resize(
+                (current_width, current_height), resampling
+            ) if (current_width, current_height) != (width, height) else image.copy()
+            try:
+                for quality in qualities:
+                    candidate = _encode_reference_jpeg(candidate_image, quality)
+                    if best is None or len(candidate) < len(best):
+                        best = candidate
+                    if len(candidate) <= target_bytes:
+                        break
+            finally:
+                candidate_image.close()
+            if best is not None and len(best) <= target_bytes:
+                break
+            if max(current_width, current_height) <= _REFERENCE_IMAGE_MIN_LONG_EDGE:
+                break
+            current_width = max(1, int(current_width * 0.86))
+            current_height = max(1, int(current_height * 0.86))
+
+    if not best:
+        raise Exception(f"参考图压缩失败: {os.path.basename(path)}")
+
+    output_path = os.path.join(
+        staging_dir,
+        f"reference_{uuid.uuid4().hex}.jpg",
+    )
+    with open(output_path, "wb") as output:
+        output.write(best)
+    return output_path
+
+
+def _prepare_reference_images(reference_images, params):
+    """Prepare local references once and return (mapping, cleanup callback)."""
+    normalized = _normalize_reference_images(reference_images)
+    if not normalized:
+        return {}, lambda: None
+
+    target_bytes = _reference_target_bytes(params)
+    local_paths = []
+    for _, value in normalized.items():
+        text = str(value or "").strip()
+        if text and not text.lower().startswith(("http://", "https://")):
+            if os.path.exists(text) and os.path.getsize(text) > 0:
+                local_paths.append(os.path.abspath(text))
+
+    if not local_paths:
+        return normalized, lambda: None
+
+    # Prepared JPEGs are reused by every concurrent storyboard item. Avoid
+    # creating a throwaway staging directory for each stage when no work is
+    # needed.
+    if all(
+        os.path.splitext(path)[1].lower() in {".jpg", ".jpeg"}
+        and os.path.getsize(path) <= target_bytes
+        for path in local_paths
+    ):
+        return normalized, lambda: None
+
+    staging_dir = tempfile.mkdtemp(prefix="yaliai-reference-")
+    prepared = dict(normalized)
+    try:
+        for position, value in normalized.items():
+            text = str(value or "").strip()
+            if not text or text.lower().startswith(("http://", "https://")):
+                continue
+            if os.path.exists(text) and os.path.getsize(text) > 0:
+                prepared[position] = _compress_reference_file(text, staging_dir, target_bytes)
+    except Exception:
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    def cleanup():
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    return prepared, cleanup
 
 
 def _merge_runtime_params(context):
@@ -2049,7 +2195,7 @@ def generate(context):
         return _is_cancelled(context)
 
     generated_files = [None] * batch_num
-
+    reference_images, cleanup_reference_images = _prepare_reference_images(reference_images, params)
     reference_image_count = len(_normalize_reference_images(reference_images))
 
     def stage_progress(start_percent, end_percent):
@@ -2092,45 +2238,49 @@ def generate(context):
             if is_cancelled():
                 raise Exception("任务已被宿主取消")
             progress("生成中", start_percent)
-            if stage_model in GPT_IMAGE_MODELS:
-                outputs = send_gpt_image_request(
-                    api_key=_api_key_for_model(params, stage_model),
-                    endpoint=endpoint,
-                    model=stage_model,
-                    prompt=stage_prompt,
-                    reference_images=stage_references,
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    quality=quality,
-                    request_timeout=request_timeout,
-                    download_timeout=download_timeout,
-                    async_initial_delay=initial_delay,
-                    async_poll_interval=poll_interval,
-                    async_max_wait=max_wait,
-                    progress=stage_progress(start_percent, end_percent),
-                    request_id=stage_request_id,
-                    is_cancelled=is_cancelled,
-                    task_metadata=stage_metadata,
-                )
-            else:
-                outputs = send_gemini_request(
-                    api_key=_api_key_for_model(params, stage_model),
-                    endpoint=endpoint,
-                    model=stage_model,
-                    prompt=stage_prompt,
-                    reference_images=stage_references,
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    request_timeout=request_timeout,
-                    download_timeout=download_timeout,
-                    async_initial_delay=initial_delay,
-                    async_poll_interval=poll_interval,
-                    async_max_wait=max_wait,
-                    progress=stage_progress(start_percent, end_percent),
-                    request_id=stage_request_id,
-                    is_cancelled=is_cancelled,
-                    task_metadata=stage_metadata,
-                )
+            prepared_references, cleanup_stage_references = _prepare_reference_images(stage_references, params)
+            try:
+                if stage_model in GPT_IMAGE_MODELS:
+                    outputs = send_gpt_image_request(
+                        api_key=_api_key_for_model(params, stage_model),
+                        endpoint=endpoint,
+                        model=stage_model,
+                        prompt=stage_prompt,
+                        reference_images=prepared_references,
+                        aspect_ratio=aspect_ratio,
+                        image_size=image_size,
+                        quality=quality,
+                        request_timeout=request_timeout,
+                        download_timeout=download_timeout,
+                        async_initial_delay=initial_delay,
+                        async_poll_interval=poll_interval,
+                        async_max_wait=max_wait,
+                        progress=stage_progress(start_percent, end_percent),
+                        request_id=stage_request_id,
+                        is_cancelled=is_cancelled,
+                        task_metadata=stage_metadata,
+                    )
+                else:
+                    outputs = send_gemini_request(
+                        api_key=_api_key_for_model(params, stage_model),
+                        endpoint=endpoint,
+                        model=stage_model,
+                        prompt=stage_prompt,
+                        reference_images=prepared_references,
+                        aspect_ratio=aspect_ratio,
+                        image_size=image_size,
+                        request_timeout=request_timeout,
+                        download_timeout=download_timeout,
+                        async_initial_delay=initial_delay,
+                        async_poll_interval=poll_interval,
+                        async_max_wait=max_wait,
+                        progress=stage_progress(start_percent, end_percent),
+                        request_id=stage_request_id,
+                        is_cancelled=is_cancelled,
+                        task_metadata=stage_metadata,
+                    )
+            finally:
+                cleanup_stage_references()
             if not outputs:
                 raise Exception(f"第 {index + 1} 个鸭梨 AI 任务完成但没有图片输出")
             if len(outputs) > 1:
@@ -2293,6 +2443,8 @@ def generate(context):
     except Exception as exc:
         print(f"鸭梨 AI 异步任务失败: {exc}")
         raise Exception(f"PLUGIN_ERROR:::{exc}") from exc
+    finally:
+        cleanup_reference_images()
 
 
 # ===================== 初始化 =====================

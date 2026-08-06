@@ -143,6 +143,18 @@
           <button class="toggle-eye" type="button" data-target="geminiApiKeyInput" aria-label="显示或隐藏 Gemini API Key">显示</button>
         </div></div>
       </div>
+      <div class="form-row">
+        <label class="form-label">Reference image target</label>
+        <div class="form-control">
+          <select id="referenceImageTargetMb">
+            <option value="1">About 1 MB</option>
+            <option value="2" selected>About 2 MB (recommended)</option>
+            <option value="4">About 4 MB</option>
+            <option value="8">About 8 MB</option>
+          </select>
+          <div class="field-hint">Images are resized proportionally and encoded as JPEG before upload. The original file is never modified.</div>
+        </div>
+      </div>
     </section>
   </div>
 
@@ -154,6 +166,7 @@
       image_size: '4K',
       quality: 'medium',
       generation_mode: 'default',
+      reference_image_target_mb: 2,
       upscale_model: 'gemini-3-pro-image-preview',
       upscale_prompt: '现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。请将图像精细度和文字边缘细节提升至 {{image_size}} 电影级分辨率。场景清晰不允许存在锯齿和噪点，颜色纯净。请在画面中原地追加细节。保持图像 {{aspect_ratio}} 比例，不要因为限制图像比例而使用变形的素材和文字。图像比例不对将判定为任务失败！'
     }
@@ -161,6 +174,7 @@
       endpoint: document.getElementById('endpointInput'),
       gpt_api_key: document.getElementById('gptApiKeyInput'),
       gemini_api_key: document.getElementById('geminiApiKeyInput'),
+      reference_image_target_mb: document.getElementById('referenceImageTargetMb'),
       model: document.getElementById('modelSelect'),
       upscale_model: document.getElementById('upscaleModelSelect'),
       upscale_prompt: document.getElementById('upscalePromptInput'),

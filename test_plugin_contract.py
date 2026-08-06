@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+
 
 PLUGIN_PATH = Path(__file__).with_name("main.py")
 _spec = importlib.util.spec_from_file_location("yaliai_image_plugin_test", PLUGIN_PATH)
@@ -85,6 +87,41 @@ class _DownloadSession:
 
 
 class PluginContractTests(unittest.TestCase):
+    def test_reference_images_are_compressed_to_temporary_jpeg(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as stage_dir:
+            source_path = Path(source_dir) / "reference.png"
+            with Image.new("RGBA", (5000, 3000), (20, 80, 140, 255)) as image:
+                image.save(source_path, "PNG")
+            original_size = source_path.stat().st_size
+
+            prepared, cleanup = plugin._prepare_reference_images(
+                {0: str(source_path)}, {"reference_image_target_mb": 1}
+            )
+            try:
+                prepared_path = Path(prepared[0])
+                self.assertNotEqual(prepared_path, source_path)
+                self.assertEqual(prepared_path.suffix, ".jpg")
+                self.assertLess(prepared_path.stat().st_size, 1024 * 1024)
+                self.assertEqual(source_path.stat().st_size, original_size)
+                with Image.open(prepared_path) as image:
+                    self.assertEqual(image.size, (4096, 2458))
+            finally:
+                cleanup()
+            self.assertFalse(prepared_path.exists())
+
+    def test_large_reference_is_compressed_instead_of_rejected(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            source_path = Path(source_dir) / "large.png"
+            source_path.write_bytes(base64.b64decode(PNG_1X1) + b"x" * (11 * 1024 * 1024))
+            prepared, cleanup = plugin._prepare_reference_images(
+                {0: str(source_path)}, {"reference_image_target_mb": 2}
+            )
+            try:
+                self.assertTrue(Path(prepared[0]).suffix == ".jpg")
+                self.assertLessEqual(Path(prepared[0]).stat().st_size, 2 * 1024 * 1024)
+            finally:
+                cleanup()
+
     def test_default_openai_size_is_4k_16_by_9(self):
         self.assertEqual(plugin._default_params["quality"], "medium")
         self.assertEqual(plugin._default_params["image_size"], "4K")

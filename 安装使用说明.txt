@@ -15,6 +15,7 @@
    - gpt-image-2：OpenAI Images 接口。
    - gemini-3.1-flash-image-preview、gemini-3-pro-image-preview：Gemini 接口。
 5. 关闭设置窗口后即可在工具的图像生成界面调用。
+6. “参考图压缩目标”控制上传前的临时压缩大小，默认约 2MB。参考图会保持比例并统一转为 JPEG；原始文件不会被修改，超过 10MB 也会尝试压缩，不会因为文件大小直接拒绝。
 
 三、生成模式
 1. 默认（单模型）：只调用当前选择的模型。
