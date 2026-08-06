@@ -103,6 +103,10 @@ class PluginContractTests(unittest.TestCase):
         )
         self.assertEqual(prompt, "target 4K / 16:9 and 4K / 16:9")
 
+    def test_upscale_defaults_to_gemini_pro_and_doubles_workflow_budget(self):
+        self.assertEqual(plugin._default_params["upscale_model"], "gemini-3-pro-image-preview")
+        self.assertEqual(plugin._ASYNC_MAX_WAIT_SECONDS * 2, 3600)
+
     def test_model_family_uses_its_own_credential(self):
         params = {
             "gpt_api_key": "gpt-key",
@@ -139,6 +143,8 @@ class PluginContractTests(unittest.TestCase):
             stage_order.append("upscale")
             reference_path = kwargs["reference_images"][0]
             upscale_reference_paths.append(reference_path)
+            self.assertEqual(kwargs["model"], "gpt-image-2")
+            self.assertEqual(kwargs["api_key"], "upscale-key")
             self.assertTrue(Path(reference_path).exists())
             self.assertIn("4K", kwargs["prompt"])
             self.assertIn("16:9", kwargs["prompt"])
@@ -172,6 +178,38 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(len(paths), 1)
         self.assertTrue(final_file_exists)
         self.assertFalse(Path(upscale_reference_paths[0]).exists())
+
+    def test_upscale_gemini_model_uses_gemini_branch_and_key(self):
+        calls = []
+
+        def fake_gemini(**kwargs):
+            calls.append((kwargs["model"], kwargs["api_key"], kwargs["reference_images"]))
+            return [{"type": "b64", "value": PNG_1X1, "task_id": kwargs["model"]}]
+
+        with tempfile.TemporaryDirectory() as output_dir, patch.object(
+            plugin, "send_gemini_request", side_effect=fake_gemini
+        ):
+            plugin.generate({
+                "prompt": "gemini upscale test",
+                "output_dir": output_dir,
+                "plugin_params": {
+                    "gemini_api_key": "source-and-upscale-key",
+                    "model": "gemini-3.1-flash-image-preview",
+                    "generation_mode": "upscale",
+                    "upscale_model": "gemini-3-pro-image-preview",
+                    "upscale_prompt": "enhance {{image_size}} {{aspect_ratio}}",
+                },
+            })
+
+        self.assertEqual([item[0] for item in calls], [
+            "gemini-3.1-flash-image-preview",
+            "gemini-3-pro-image-preview",
+        ])
+        self.assertEqual([item[1] for item in calls], [
+            "source-and-upscale-key",
+            "source-and-upscale-key",
+        ])
+        self.assertEqual(calls[1][2].keys(), {0})
 
     def test_upscale_mode_validates_second_model_key_before_source_request(self):
         with tempfile.TemporaryDirectory() as output_dir, patch.object(

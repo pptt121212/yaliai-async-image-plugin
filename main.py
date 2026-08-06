@@ -132,7 +132,7 @@ _default_params = {
     "image_size": "4K",
     "quality": "medium",
     "generation_mode": "default",
-    "upscale_model": "gpt-image-2",
+    "upscale_model": "gemini-3-pro-image-preview",
     "upscale_prompt": _DEFAULT_UPSCALE_PROMPT,
 }
 
@@ -1962,7 +1962,7 @@ def generate(context):
     image_size = str(params.get("image_size", "4K") or "4K").strip().upper()
     quality = str(params.get("quality", "medium") or "medium").strip().lower()
     generation_mode = str(params.get("generation_mode", "default") or "default").strip().lower()
-    upscale_model = _normalize_model(params.get("upscale_model", "gpt-image-2"))
+    upscale_model = _normalize_model(params.get("upscale_model", "gemini-3-pro-image-preview"))
     upscale_prompt_template = str(
         params.get("upscale_prompt", _DEFAULT_UPSCALE_PROMPT) or _DEFAULT_UPSCALE_PROMPT
     ).strip()
@@ -1971,6 +1971,7 @@ def generate(context):
     initial_delay = _ASYNC_INITIAL_DELAY_SECONDS
     poll_interval = _ASYNC_POLL_INTERVAL_SECONDS
     max_wait = _ASYNC_MAX_WAIT_SECONDS
+    workflow_max_wait = max_wait * (2 if generation_mode == "upscale" else 1)
     batch_num = _safe_int(context.get("batch_num", 1), 1)
     if batch_num < 1 or batch_num > _MAX_BATCH_NUM:
         raise Exception(f"PLUGIN_ERROR:::batch_num 必须在 1 到 {_MAX_BATCH_NUM} 之间")
@@ -2061,6 +2062,8 @@ def generate(context):
             "pipeline_stage": "source" if generation_mode == "upscale" else "single",
             "source_model": model if generation_mode == "upscale" else "",
             "source_task_id": "",
+            "stage_max_wait": max_wait,
+            "workflow_max_wait": workflow_max_wait,
             "viewer_index": _safe_int(context.get("viewer_index", 0), 0),
             "unique_name": str(context.get("unique_name", "") or ""),
             "generation_round": _safe_int(context.get("generation_round", 0), 0),

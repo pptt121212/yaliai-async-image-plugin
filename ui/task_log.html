@@ -13,11 +13,11 @@
     .toolbar .spacer { flex: 1; }
     .meta { color: var(--text-muted); font-size: 11px; }
     .table-wrap { overflow: auto; max-height: calc(100vh - 150px); }
-    table { width: 100%; min-width: 1100px; border-collapse: collapse; }
+    table { width: 100%; min-width: 980px; border-collapse: collapse; }
     th { position: sticky; top: 0; background: var(--bg-primary); text-align: left; white-space: nowrap; }
     td, th { padding: 7px 8px; border-bottom: 1px solid var(--border-color); vertical-align: top; font-size: 12px; }
     .task-id { width: 132px; max-width: 132px; font-family: monospace; white-space: normal; overflow-wrap: anywhere; word-break: break-all; }
-    .panel { min-width: 150px; white-space: nowrap; }
+    .panel, th:nth-child(2) { display: none; }
     .model { min-width: 230px; }
     .time { white-space: nowrap; }
     .status { white-space: nowrap; }
@@ -141,7 +141,8 @@
         var panel = '序号 ' + esc(task.viewer_index || '-') + '<br>槽位 ' + esc(task.output_position || '-') + '<br>' + esc(task.unique_name || '-')
         var stage = task.pipeline_stage === 'source' ? 'A 中间' : (task.pipeline_stage === 'upscale' ? 'B 最终' : '单阶段')
         var settings = esc(stage) + '<br>' + esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
-        var trace = esc(task.trace_id || '-') + '<br>' + esc(task.request_id || '-')
+        var mode = task.generation_mode === 'upscale' ? '瓒呭垎' : '榛樿'
+        settings = esc(mode) + '<br>' + settings
         row.innerHTML =
           '<td class="task-id">' + esc(task.task_id) + '</td>' +
           '<td class="panel">' + panel + '</td>' +
@@ -149,7 +150,7 @@
           '<td class="status">' + esc(task.status || task.event || '-') + '<br>事件 ' + esc(task.event_count || 0) + '</td>' +
           '<td class="time">' + esc(formatTime(task.updated_at)) + '</td>' +
           '<td class="prompt" title="' + esc(task.prompt_preview || '') + '">' + esc(task.prompt_preview || '-') + '</td>' +
-          '<td class="detail">' + result + '<br><small>' + trace + '</small></td>'
+          '<td class="detail">' + result + '</td>'
         logBody.appendChild(row)
       })
     }
