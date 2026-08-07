@@ -521,31 +521,41 @@ def _compress_reference_file(path, staging_dir, target_bytes, is_cancelled=lambd
             current_height = max(1, int(round(height * scale)))
 
         best = None
-        # The browser implementation tries quality first, then scales down
-        # progressively if the target cannot be reached without distortion.
-        qualities = (92, 90, 88, 86, 84, 82, 80, 78, 76, 74, 72)
-        for _ in range(9):
+        # Use a small quality ladder, then estimate the next scale from the
+        # actual encoded size. This avoids dozens of full JPEG encodes while
+        # retaining a final size correction pass.
+        qualities = (90, 84, 78)
+        for _ in range(6):
             if is_cancelled():
                 raise Exception("任务已被宿主取消；参考图压缩已停止")
             resampling = getattr(Image, "Resampling", Image).LANCZOS
             candidate_image = image.resize(
                 (current_width, current_height), resampling
             ) if (current_width, current_height) != (width, height) else image.copy()
+            current_best = None
             try:
                 for quality in qualities:
                     candidate = _encode_reference_jpeg(candidate_image, quality)
+                    if current_best is None or len(candidate) < len(current_best):
+                        current_best = candidate
                     if best is None or len(candidate) < len(best):
                         best = candidate
                     if len(candidate) <= target_bytes:
                         break
             finally:
                 candidate_image.close()
-            if best is not None and len(best) <= target_bytes:
+            if current_best is not None and len(current_best) <= target_bytes:
                 break
             if max(current_width, current_height) <= _REFERENCE_IMAGE_MIN_LONG_EDGE:
                 break
-            current_width = max(1, int(current_width * 0.86))
-            current_height = max(1, int(current_height * 0.86))
+            size_ratio = (
+                (target_bytes / max(1, len(current_best))) ** 0.5 * 0.96
+                if current_best
+                else 0.72
+            )
+            size_ratio = max(0.55, min(0.90, size_ratio))
+            current_width = max(1, int(current_width * size_ratio))
+            current_height = max(1, int(current_height * size_ratio))
 
     if not best or len(best) > target_bytes:
         raise Exception(f"参考图压缩失败: {os.path.basename(path)}")
