@@ -856,6 +856,67 @@ def _compress_delivered_output(path, params, is_cancelled=lambda: False):
         return str(source)
 
 
+def _compress_manual_replacement_output(path, params, is_cancelled=lambda: False):
+    """Fit a manual replacement under its limit without changing the host's fixed PNG path."""
+    source = Path(path)
+    target_bytes = _local_result_target_bytes(params)
+    if not source.is_file() or source.stat().st_size <= target_bytes:
+        return str(source)
+
+    # The host continues to reference the original .png path after a manual
+    # replacement. Do not write JPEG bytes under that name or change its MIME.
+    if source.suffix.lower() not in {".png"}:
+        return _compress_delivered_output(str(source), params, is_cancelled=is_cancelled)
+
+    try:
+        _local_reference_compression_gate.acquire(is_cancelled)
+        try:
+            with Image.open(source) as opened:
+                opened.load()
+                image = ImageOps.exif_transpose(opened)
+                if image.mode not in {"RGB", "RGBA"}:
+                    image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+                width, height = image.size
+                current_width, current_height = width, height
+                for _ in range(6):
+                    if is_cancelled():
+                        raise Exception("任务已被宿主取消；本地结果压缩已停止")
+                    candidate = image.resize(
+                        (current_width, current_height),
+                        getattr(Image, "Resampling", Image).LANCZOS,
+                    ) if (current_width, current_height) != (width, height) else image.copy()
+                    temporary = source.with_name(
+                        f".{source.stem}.compress-{uuid.uuid4().hex}.png"
+                    )
+                    try:
+                        candidate.save(temporary, "PNG", optimize=True, compress_level=9)
+                        encoded_bytes = temporary.stat().st_size
+                        if encoded_bytes <= target_bytes:
+                            os.replace(temporary, source)
+                            print(
+                                f"[Yali AI Image] 手动超分结果已压缩: {source.name} "
+                                f"({source.stat().st_size / 1024 / 1024:.2f} MB)"
+                            )
+                            return str(source)
+                    finally:
+                        candidate.close()
+                        temporary.unlink(missing_ok=True)
+
+                    if max(current_width, current_height) <= _REFERENCE_IMAGE_MIN_LONG_EDGE:
+                        break
+                    ratio = (target_bytes / max(1, encoded_bytes)) ** 0.5 * 0.98
+                    ratio = max(0.72, min(0.94, ratio))
+                    current_width = max(1, int(current_width * ratio))
+                    current_height = max(1, int(current_height * ratio))
+        finally:
+            _local_reference_compression_gate.release()
+    except Exception as exc:
+        # A finished manual replacement must remain usable even when local
+        # optimization cannot satisfy the configured size target.
+        print(f"[Yali AI Image] 手动超分结果压缩跳过: {exc}")
+    return str(source)
+
+
 def _prepare_reference_images(reference_images, params, is_cancelled=lambda: False):
     """Prepare local references once and return (mapping, cleanup callback)."""
     normalized = _normalize_reference_images(reference_images)
@@ -1605,6 +1666,7 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
                 _local_delivery_gate.release()
                 delivery_slot = False
 
+            staged_path = _compress_manual_replacement_output(staged_path, params)
             if _file_fingerprint(source) != original_fingerprint:
                 raise Exception("原图在超分期间已变化，已取消替换以避免覆盖新图片")
             backup_dir = source.parent / ".yaliai-backups"
