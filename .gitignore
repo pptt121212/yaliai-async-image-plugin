@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 config.json
 async_tasks.jsonl
+task_thumbnails/

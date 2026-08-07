@@ -18,6 +18,8 @@
 import os
 import re
 import base64
+import hashlib
+import shutil
 import time
 import json
 import threading
@@ -49,9 +51,13 @@ plugin_dir = Path(__file__).parent
 # ===================== 自管理配置文件 =====================
 
 _CONFIG_PATH = plugin_dir / "config.json"
+_CONFIGURED_REFERENCE_DIR = plugin_dir / "configured_references"
 _config_lock = threading.Lock()
 _ASYNC_TASK_LOG_PATH = plugin_dir / "async_tasks.jsonl"
 _async_task_log_lock = threading.Lock()
+_TASK_THUMBNAIL_DIR = plugin_dir / "task_thumbnails"
+_manual_upscale_jobs_lock = threading.Lock()
+_manual_upscale_jobs = set()
 _GATEWAY_ENDPOINT = "https://api.yaliai.com"
 _DEFAULT_UPSCALE_PROMPT = (
     "现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。"
@@ -134,7 +140,10 @@ _default_params = {
     "quality": "medium",
     "generation_mode": "default",
     "upscale_model": "gemini-3-pro-image-preview",
+    "upscale_image_size": "4K",
     "upscale_prompt": _DEFAULT_UPSCALE_PROMPT,
+    "local_result_max_mb": 5,
+    "configured_reference_images": [],
 }
 
 # These are execution guarantees, not end-user tuning knobs. A gateway image
@@ -156,13 +165,28 @@ _RETIRED_PARAM_KEYS = {
     "async_poll_interval",
     "async_max_wait",
     "retry_count",
+    "upscale_trigger_size",
 }
 
 _REFERENCE_IMAGE_MAX_LONG_EDGE = 4096
+_REFERENCE_IMAGE_SOFT_PIXELS = 12 * 1000 * 1000
 _REFERENCE_IMAGE_MAX_PIXELS = 16 * 1000 * 1000
 _REFERENCE_IMAGE_MIN_LONG_EDGE = 320
-_REFERENCE_IMAGE_THRESHOLD_BYTES = 5 * 1024 * 1024
+_REFERENCE_IMAGE_THRESHOLD_BYTES = 2 * 1024 * 1024
 _REFERENCE_IMAGE_TARGET_BYTES = _REFERENCE_IMAGE_THRESHOLD_BYTES - 1
+_REFERENCE_IMAGE_MIN_TARGET_BYTES = 300 * 1024
+_REFERENCE_IMAGE_TARGET_BYTES_PER_PIXEL = 1.2
+_MANUAL_UPSCALE_BATCH_LIMIT = 40
+_SUPPORTED_ASPECT_RATIOS = {
+    "1:1": 1.0,
+    "16:9": 16 / 9,
+    "9:16": 9 / 16,
+    "4:3": 4 / 3,
+    "3:4": 3 / 4,
+    "3:2": 3 / 2,
+    "2:3": 2 / 3,
+    "21:9": 21 / 9,
+}
 
 
 class _FifoGate:
@@ -269,6 +293,8 @@ IMAGE_SIZES = [
     "4K",
 ]
 
+_IMAGE_SIZE_RANKS = {size: index for index, size in enumerate(IMAGE_SIZES, start=1)}
+
 
 # ===================== OpenAI Images 尺寸映射 =====================
 """
@@ -356,6 +382,11 @@ def _safe_int(value, default):
         return default
 
 
+def _normalize_image_size(value, default="1K"):
+    size = str(value or default).strip().upper()
+    return size if size in _IMAGE_SIZE_RANKS else default
+
+
 def _prompt_preview(value, limit=120):
     """Keep only a bounded, Unicode-safe prompt hint for local task logs."""
     text = str(value or "").strip()
@@ -415,6 +446,122 @@ def _api_key_for_model(params, model):
     if api_key:
         return api_key
     return str(params.get("api_key", "") or "").strip()
+
+
+def _configured_reference_paths():
+    """Read only the plugin-owned reference configuration, never host params."""
+    config = _load_config()
+    values = config.get("configured_reference_images", []) if isinstance(config, dict) else []
+    if not isinstance(values, (list, tuple)):
+        return []
+
+    root = _CONFIGURED_REFERENCE_DIR.resolve()
+    paths = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        candidate = Path(value).expanduser()
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file() and resolved.stat().st_size > 0:
+            paths.append(str(resolved))
+    return paths[:8]
+
+
+def _merge_reference_images(host_references, configured_paths):
+    """Keep host order, then append the plugin's explicitly configured images."""
+    values = []
+    if host_references:
+        values.append(host_references)
+    values.extend(configured_paths or [])
+    return _normalize_reference_images(values)
+
+
+def _configured_reference_info():
+    result = []
+    for path in _configured_reference_paths():
+        try:
+            item = Path(path)
+            result.append({"name": item.name, "path": path, "size": item.stat().st_size})
+        except OSError:
+            continue
+    return result
+
+
+def _remove_configured_reference_files(paths):
+    root = _CONFIGURED_REFERENCE_DIR.resolve()
+    for value in paths or []:
+        try:
+            path = Path(value).expanduser().resolve()
+            path.relative_to(root)
+            if path.is_file():
+                path.unlink()
+        except (OSError, ValueError):
+            continue
+
+
+def _save_configured_references(images):
+    """Persist uploaded references without modifying the user's source files."""
+    if not isinstance(images, list) or len(images) > 8:
+        return {"ok": False, "error": "参考图最多 8 张"}
+
+    staging_dir = Path(tempfile.mkdtemp(prefix="configured-references-", dir=str(plugin_dir)))
+    saved = []
+    try:
+        _CONFIGURED_REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+        for index, item in enumerate(images):
+            if not isinstance(item, dict):
+                raise ValueError("参考图数据格式无效")
+            data_url = str(item.get("data_url", "") or "")
+            if "," not in data_url or not data_url.lower().startswith("data:"):
+                raise ValueError("参考图必须是本地上传文件")
+            header, encoded = data_url.split(",", 1)
+            raw = base64.b64decode(encoded, validate=True)
+            if not raw:
+                raise ValueError("参考图为空文件")
+            source_path = staging_dir / f"source_{index}.bin"
+            source_path.write_bytes(raw)
+            with Image.open(source_path) as opened:
+                opened.verify()
+
+            suffix = ".png"
+            if "jpeg" in header.lower() or "jpg" in header.lower():
+                suffix = ".jpg"
+            elif "webp" in header.lower():
+                suffix = ".webp"
+            final_source = source_path
+            if source_path.stat().st_size > _REFERENCE_IMAGE_THRESHOLD_BYTES:
+                compressed = _compress_reference_file(
+                    str(source_path), str(staging_dir), _REFERENCE_IMAGE_TARGET_BYTES
+                )
+                final_source = Path(compressed)
+                suffix = ".jpg"
+
+            target = staging_dir / f"reference_{index}{suffix}"
+            if final_source != target:
+                final_source.replace(target)
+            saved.append(target)
+
+        # Remove the previous managed files before installing the new set. The
+        # target names are deterministic, so deleting old paths after the move
+        # could delete the newly saved file when its name is unchanged.
+        for old in _CONFIGURED_REFERENCE_DIR.glob("*"):
+            if old.is_file():
+                old.unlink()
+        for source in saved:
+            source.replace(_CONFIGURED_REFERENCE_DIR / source.name)
+        paths = [str((_CONFIGURED_REFERENCE_DIR / source.name).resolve()) for source in saved]
+        if not _save_config({"configured_reference_images": paths}):
+            raise RuntimeError("参考图配置保存失败")
+        return {"ok": True, "images": _configured_reference_info()}
+    except Exception as exc:
+        return {"ok": False, "error": f"参考图保存失败: {exc}"}
+    finally:
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _normalize_reference_images(reference_images):
@@ -535,6 +682,14 @@ def _reference_target_bytes(params):
     return _REFERENCE_IMAGE_TARGET_BYTES
 
 
+def _reference_target_bytes_for_pixels(max_target_bytes, pixels):
+    density_target = int(max(1, pixels) * _REFERENCE_IMAGE_TARGET_BYTES_PER_PIXEL)
+    return min(
+        max(1, int(max_target_bytes)),
+        max(_REFERENCE_IMAGE_MIN_TARGET_BYTES, density_target),
+    )
+
+
 def _encode_reference_jpeg(image, quality):
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
         rgba = image.convert("RGBA")
@@ -554,20 +709,27 @@ def _encode_reference_jpeg(image, quality):
     return output.getvalue()
 
 
-def _compress_reference_file(path, staging_dir, target_bytes, is_cancelled=lambda: False):
+def _compress_reference_file(
+    path,
+    staging_dir,
+    max_target_bytes,
+    is_cancelled=lambda: False,
+    compress_threshold_bytes=None,
+):
     """Create a bounded temporary JPEG without modifying the user's file."""
     path = os.path.abspath(str(path))
     source_size = os.path.getsize(path)
     if source_size <= 0:
         raise Exception(f"参考图为空文件: {os.path.basename(path)}")
-    if source_size <= _REFERENCE_IMAGE_THRESHOLD_BYTES:
+    threshold = _REFERENCE_IMAGE_THRESHOLD_BYTES if compress_threshold_bytes is None else max(1, int(compress_threshold_bytes))
+    if source_size <= threshold:
         return path
 
     with Image.open(path) as opened:
         width, height = opened.size
         # Let decoders that support native downsampling (notably JPEG) avoid
         # materializing the full source raster before Pillow resizes it.
-        if width * height > _REFERENCE_IMAGE_MAX_PIXELS and hasattr(opened, "draft"):
+        if width * height > _REFERENCE_IMAGE_SOFT_PIXELS and hasattr(opened, "draft"):
             opened.draft("RGB", (_REFERENCE_IMAGE_MAX_LONG_EDGE, _REFERENCE_IMAGE_MAX_LONG_EDGE))
         if is_cancelled():
             raise Exception("任务已被宿主取消；参考图压缩已停止")
@@ -577,9 +739,13 @@ def _compress_reference_file(path, staging_dir, target_bytes, is_cancelled=lambd
         if width < 1 or height < 1:
             raise Exception(f"参考图尺寸无效: {os.path.basename(path)}")
 
+        target_bytes = _reference_target_bytes_for_pixels(
+            max_target_bytes, width * height
+        )
+
         needs_resize = (
             max(width, height) > _REFERENCE_IMAGE_MAX_LONG_EDGE
-            or width * height > _REFERENCE_IMAGE_MAX_PIXELS
+            or width * height > _REFERENCE_IMAGE_SOFT_PIXELS
         )
         current_width, current_height = width, height
         if needs_resize:
@@ -593,7 +759,13 @@ def _compress_reference_file(path, staging_dir, target_bytes, is_cancelled=lambd
         # Use a small quality ladder, then estimate the next scale from the
         # actual encoded size. This avoids dozens of full JPEG encodes while
         # retaining a final size correction pass.
-        qualities = (90, 84, 78)
+        bytes_per_pixel = source_size / max(1, width * height)
+        if bytes_per_pixel >= 2.5:
+            qualities = (92, 90, 88, 86, 84)
+        elif source_size >= 5 * 1024 * 1024:
+            qualities = (88, 86, 84, 82, 80)
+        else:
+            qualities = (90, 88, 86, 84, 82)
         for _ in range(6):
             if is_cancelled():
                 raise Exception("任务已被宿主取消；参考图压缩已停止")
@@ -636,6 +808,52 @@ def _compress_reference_file(path, staging_dir, target_bytes, is_cancelled=lambd
     with open(output_path, "wb") as output:
         output.write(best)
     return output_path
+
+
+def _local_result_target_bytes(params):
+    try:
+        megabytes = float(params.get("local_result_max_mb", _default_params["local_result_max_mb"]))
+    except (TypeError, ValueError):
+        megabytes = float(_default_params["local_result_max_mb"])
+    megabytes = min(50.0, max(1.0, megabytes))
+    return int(megabytes * 1024 * 1024)
+
+
+def _compress_delivered_output(path, params, is_cancelled=lambda: False):
+    """Compress only final host-visible files; staging images stay lossless for the B stage."""
+    source = Path(path)
+    target_bytes = _local_result_target_bytes(params)
+    try:
+        if not source.is_file() or source.stat().st_size <= target_bytes:
+            return str(source)
+        _local_reference_compression_gate.acquire(is_cancelled)
+        try:
+            with tempfile.TemporaryDirectory(prefix="yaliai-result-compress-", dir=str(source.parent)) as staging_dir:
+                compressed_path = _compress_reference_file(
+                    str(source),
+                    staging_dir,
+                    target_bytes,
+                    is_cancelled=is_cancelled,
+                    compress_threshold_bytes=target_bytes,
+                )
+                if os.path.abspath(compressed_path) == os.path.abspath(str(source)):
+                    return str(source)
+                destination = source.with_suffix(".jpg")
+                os.replace(compressed_path, destination)
+                if source != destination:
+                    source.unlink(missing_ok=True)
+                print(
+                    f"[Yali AI Image] 本地结果已压缩: {source.name} -> {destination.name} "
+                    f"({destination.stat().st_size / 1024 / 1024:.2f} MB)"
+                )
+                return str(destination)
+        finally:
+            _local_reference_compression_gate.release()
+    except Exception as exc:
+        # Image generation and host delivery have succeeded. A local size
+        # optimization must never discard that successful result.
+        print(f"[Yali AI Image] 本地结果压缩跳过: {exc}")
+        return str(source)
 
 
 def _prepare_reference_images(reference_images, params, is_cancelled=lambda: False):
@@ -737,7 +955,7 @@ def get_info():
     return {
         "name": "鸭梨AI图像生成插件(低价版)",
         "description": "通过鸭梨 AI 网关异步生成图片，支持 Gemini 原生接口、OpenAI Images 文件上传和任务日志。",
-        "version": "3.1.0",
+        "version": "3.3.0",
         "author": "Yali AI",
     }
 
@@ -766,6 +984,18 @@ def handle_action(action, data=None):
 
     if action == "open_task_logs":
         return {"ok": True, "open_page": "task_log.html"}
+
+    if action == "get_configured_references":
+        return {"ok": True, "images": _configured_reference_info()}
+
+    if action == "save_configured_references":
+        return _save_configured_references(data.get("images", []))
+
+    if action == "clear_configured_references":
+        current = _configured_reference_paths()
+        _remove_configured_reference_files(current)
+        _save_config({"configured_reference_images": []})
+        return {"ok": True, "images": []}
 
     if action == "save_param":
         key = data.get("key")
@@ -827,6 +1057,15 @@ def handle_action(action, data=None):
             days = min(3650, max(1, _safe_int(data.get("days", 30), 30)))
             removed = _clear_async_task_logs(before_timestamp=time.time() - days * 86400)
         return {"ok": True, "removed": removed}
+
+    elif action == "start_manual_upscale":
+        return _start_manual_upscale(data.get("task_id"))
+
+    elif action == "start_manual_upscale_batch":
+        return _start_manual_upscale_batch(data.get("task_ids"))
+
+    elif action == "open_local_task_image":
+        return _open_local_task_image(data.get("task_id"))
 
     return {"ok": False, "error": f"未知动作: {action}"}
 
@@ -893,6 +1132,8 @@ def _summarize_async_task_events(events):
             "protocol": "",
             "generation_mode": "default",
             "pipeline_stage": "",
+            "upscale_target_image_size": "",
+            "upscale_applied": False,
             "source_model": "",
             "source_task_id": "",
             "viewer_index": 0,
@@ -902,7 +1143,11 @@ def _summarize_async_task_events(events):
             "batch_index": 0,
             "batch_num": 1,
             "reference_image_count": 0,
+            "shared_reference_prepare_ms": 0,
+            "stage_reference_prepare_ms": 0,
+            "submit_elapsed_ms": 0,
             "prompt_preview": "",
+            "backup_path": "",
         })
         summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
         summary["updated_at"] = max(summary["updated_at"], timestamp)
@@ -911,8 +1156,11 @@ def _summarize_async_task_events(events):
         for key in (
             "status", "error", "trace_id", "request_id", "query_path", "output_path", "output_type",
             "model", "quality", "image_size", "aspect_ratio", "request_size", "protocol", "generation_mode", "pipeline_stage",
+            "upscale_target_image_size", "upscale_applied",
             "source_model", "source_task_id", "viewer_index", "unique_name",
-            "generation_round", "output_position", "batch_index", "batch_num", "reference_image_count", "prompt_preview",
+            "generation_round", "output_position", "batch_index", "batch_num", "reference_image_count",
+            "shared_reference_prepare_ms", "stage_reference_prepare_ms", "submit_elapsed_ms", "prompt_preview",
+            "backup_path",
         ):
             if event.get(key) not in (None, ""):
                 summary[key] = event[key]
@@ -927,22 +1175,96 @@ def _summarize_async_task_events(events):
 
 
 def _query_async_task_logs(page, page_size, status="", task_id=""):
-    tasks = _summarize_async_task_events(_read_async_task_events())
+    all_tasks = _summarize_async_task_events(_read_async_task_events())
+    upscale_states = _build_manual_upscale_states(all_tasks)
+    tasks = _group_upscale_workflows(all_tasks)
     if task_id:
-        tasks = [item for item in tasks if task_id.lower() in item["task_id"].lower()]
+        needle = task_id.lower()
+        tasks = [
+            item for item in tasks
+            if needle in item["task_id"].lower()
+            or needle in str((item.get("source_task") or {}).get("task_id", "")).lower()
+        ]
     if status:
         tasks = [item for item in tasks if str(item.get("status", "")).lower() == status]
     total = len(tasks)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = min(max(1, page), total_pages)
     start = (page - 1) * page_size
+    page_tasks = tasks[start:start + page_size]
+    for item in page_tasks:
+        _attach_local_image_preview(item)
+        source_task = item.get("source_task")
+        if isinstance(source_task, dict):
+            _attach_local_image_preview(source_task)
+        state = upscale_states.get(str(item.get("task_id", "")), "unavailable")
+        item["upscale_state"] = state
+        item["already_upscaled"] = state == "already_upscaled"
+        item["can_manual_upscale"] = state == "eligible" and bool(item.get("local_image_exists"))
     return {
-        "tasks": tasks[start:start + page_size],
+        "tasks": page_tasks,
         "page": page,
         "page_size": page_size,
         "total": total,
         "total_pages": total_pages,
     }
+
+
+def _group_upscale_workflows(tasks):
+    """Collapse automatic and manual A/B upscale stages into one workflow row."""
+    by_task_id = {str(item.get("task_id", "")): item for item in tasks}
+    hidden_source_ids = set()
+    manual_by_source = {}
+    manual_child_ids = set()
+    for item in tasks:
+        source_id = str(item.get("source_task_id", "") or "")
+        if (
+            str(item.get("generation_mode", "")).lower() == "manual_upscale"
+            and source_id in by_task_id
+        ):
+            task_id = str(item.get("task_id", ""))
+            manual_child_ids.add(task_id)
+            rank = (
+                _safe_int(item.get("updated_at", 0), 0),
+                _safe_int(item.get("event_count", 0), 0),
+            )
+            current = manual_by_source.get(source_id)
+            if current is None or rank >= current[0]:
+                manual_by_source[source_id] = (rank, item)
+
+    grouped = []
+    for item in tasks:
+        task_id = str(item.get("task_id", ""))
+        source_id = str(item.get("source_task_id", "") or "")
+        is_auto_upscale = (
+            str(item.get("generation_mode", "")).lower() == "upscale"
+            and str(item.get("pipeline_stage", "")).lower() == "upscale"
+            and source_id in by_task_id
+        )
+        is_current_manual = (
+            source_id in manual_by_source
+            and manual_by_source[source_id][1] is item
+        )
+        if is_auto_upscale:
+            combined = dict(item)
+            combined["workflow_type"] = "upscale"
+            combined["source_task"] = dict(by_task_id[source_id])
+            grouped.append(combined)
+            hidden_source_ids.add(source_id)
+        elif is_current_manual:
+            combined = dict(item)
+            combined["workflow_type"] = "manual_upscale"
+            combined["source_task"] = dict(by_task_id[source_id])
+            grouped.append(combined)
+            hidden_source_ids.add(source_id)
+        elif task_id in manual_child_ids:
+            # A manual run first has a local queue receipt, then the gateway's
+            # task ID. Present only the newest stage as one workflow row.
+            continue
+        else:
+            grouped.append(item)
+    visible = [item for item in grouped if str(item.get("task_id", "")) not in hidden_source_ids]
+    return sorted(visible, key=lambda item: _safe_int(item.get("updated_at", 0), 0), reverse=True)
 
 
 def _clear_async_task_logs(before_timestamp=None):
@@ -969,9 +1291,455 @@ def _clear_async_task_logs(before_timestamp=None):
             with open(temp_path, "w", encoding="utf-8") as handle:
                 handle.writelines(kept)
             os.replace(temp_path, _ASYNC_TASK_LOG_PATH)
+            if before_timestamp is None:
+                shutil.rmtree(_TASK_THUMBNAIL_DIR, ignore_errors=True)
+            else:
+                _trim_task_thumbnails()
             return removed
         except OSError:
             return 0
+
+
+def _trim_task_thumbnails(max_files=500):
+    try:
+        if not _TASK_THUMBNAIL_DIR.exists():
+            return
+        files = [item for item in _TASK_THUMBNAIL_DIR.glob("*.jpg") if item.is_file()]
+        files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        cutoff = time.time() - 30 * 86400
+        for index, item in enumerate(files):
+            if index >= max_files or item.stat().st_mtime < cutoff:
+                item.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _task_thumbnail_path(task_id):
+    key = hashlib.sha256(f"task:{task_id}".encode("utf-8")).hexdigest()
+    return _TASK_THUMBNAIL_DIR / f"task_{key}.jpg"
+
+
+def _thumbnail_data_url(thumbnail):
+    return "data:image/jpeg;base64," + base64.b64encode(thumbnail).decode("ascii")
+
+
+def _persist_task_thumbnail(task_id, path):
+    """Store a small local receipt before an A-stage temporary image is removed."""
+    source = Path(path)
+    if not task_id or not source.is_file():
+        return ""
+    try:
+        _TASK_THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path = _task_thumbnail_path(task_id)
+        if cache_path.exists():
+            return _thumbnail_data_url(cache_path.read_bytes())
+        with Image.open(source) as image:
+            image.load()
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.thumbnail((192, 144), Image.Resampling.LANCZOS)
+            buffer = BytesIO()
+            image.save(buffer, "JPEG", quality=80, optimize=True)
+            thumbnail = buffer.getvalue()
+        temp_path = cache_path.with_suffix(".tmp")
+        temp_path.write_bytes(thumbnail)
+        os.replace(temp_path, cache_path)
+        _trim_task_thumbnails()
+        return _thumbnail_data_url(thumbnail)
+    except Exception:
+        return ""
+
+
+def _attach_local_image_preview(summary):
+    path = Path(str(summary.get("output_path", "") or ""))
+    try:
+        summary["local_image_exists"] = path.is_file() and path.stat().st_size > 0
+    except OSError:
+        summary["local_image_exists"] = False
+    summary["local_preview_data_url"] = ""
+    task_id = str(summary.get("task_id", "") or "")
+    try:
+        cache_path = _task_thumbnail_path(task_id) if task_id else None
+        if cache_path and cache_path.exists():
+            summary["local_preview_data_url"] = _thumbnail_data_url(cache_path.read_bytes())
+        elif summary["local_image_exists"]:
+            summary["local_preview_data_url"] = _persist_task_thumbnail(task_id, path)
+    except Exception as exc:
+        summary["local_preview_error"] = str(exc)
+
+
+def _canonical_output_path(value):
+    try:
+        return str(Path(str(value or "")).resolve()).lower()
+    except OSError:
+        return ""
+
+
+def _is_upscale_result(summary):
+    return (
+        str(summary.get("generation_mode", "")).lower() in {"upscale", "manual_upscale"}
+        or str(summary.get("pipeline_stage", "")).lower() in {"upscale", "manual_upscale"}
+    )
+
+
+def _build_manual_upscale_states(tasks):
+    """Only the newest successful result for a local asset may be manually upscaled once."""
+    newest_by_path = {}
+    for summary in tasks:
+        if str(summary.get("status", "")).lower() != "success":
+            continue
+        path_key = _canonical_output_path(summary.get("output_path"))
+        if not path_key:
+            continue
+        current = newest_by_path.get(path_key)
+        rank = (_safe_int(summary.get("updated_at", 0), 0), _safe_int(summary.get("event_count", 0), 0))
+        if current is None or rank >= current[0]:
+            newest_by_path[path_key] = (rank, str(summary.get("task_id", "")), summary)
+
+    states = {}
+    for summary in tasks:
+        task_id = str(summary.get("task_id", ""))
+        if str(summary.get("status", "")).lower() != "success":
+            states[task_id] = "unavailable"
+            continue
+        path_key = _canonical_output_path(summary.get("output_path"))
+        latest = newest_by_path.get(path_key)
+        if not path_key or latest is None:
+            states[task_id] = "unavailable"
+        elif latest[1] != task_id:
+            states[task_id] = "superseded"
+        elif _is_upscale_result(summary):
+            states[task_id] = "already_upscaled"
+        else:
+            states[task_id] = "eligible"
+    return states
+
+
+def _open_local_task_image(task_id):
+    summary = _find_task_log_summary(task_id)
+    if not summary:
+        return {"ok": False, "error": "未找到任务记录"}
+    path = Path(str(summary.get("output_path", "") or ""))
+    if not path.is_file() or path.stat().st_size <= 0:
+        return {"ok": False, "error": "本地图片文件不存在"}
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except Exception as exc:
+        return {"ok": False, "error": f"本地图片无法读取: {exc}"}
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))
+        else:
+            return {"ok": False, "error": "当前系统不支持从插件打开本地图片"}
+    except OSError as exc:
+        return {"ok": False, "error": f"无法打开本地图片: {exc}"}
+    return {"ok": True, "message": "已使用系统默认图片查看器打开本地图片"}
+
+
+def _file_fingerprint(path):
+    """Return a content fingerprint so an old log row cannot overwrite a changed image."""
+    source = Path(path)
+    stat = source.stat()
+    digest = hashlib.sha256()
+    with open(source, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{digest.hexdigest()}"
+
+
+def _find_task_log_summary(task_id):
+    wanted = str(task_id or "").strip()
+    if not wanted:
+        return None
+    for item in _summarize_async_task_events(_read_async_task_events()):
+        if str(item.get("task_id", "")) == wanted:
+            return item
+    return None
+
+
+def _infer_aspect_ratio_from_image(path, fallback):
+    """Use the actual local source dimensions, not a possibly stale log value."""
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+        if width > 0 and height > 0:
+            ratio = width / height
+            return min(_SUPPORTED_ASPECT_RATIOS, key=lambda key: abs(_SUPPORTED_ASPECT_RATIOS[key] - ratio))
+    except Exception:
+        pass
+    fallback = str(fallback or "16:9").strip()
+    return fallback if fallback in _SUPPORTED_ASPECT_RATIOS else "16:9"
+
+
+def _manual_upscale_metadata(summary, params, source_task_id, source_path):
+    upscale_model = _normalize_model(params.get("upscale_model", "gemini-3-pro-image-preview"))
+    image_size = _normalize_image_size(params.get("upscale_image_size", "4K"), "4K")
+    aspect_ratio = _infer_aspect_ratio_from_image(
+        source_path, summary.get("aspect_ratio") or params.get("aspect_ratio", "16:9")
+    )
+    return {
+        "model": upscale_model,
+        "quality": str(params.get("quality", "medium") or "medium").strip().lower(),
+        "image_size": image_size,
+        "aspect_ratio": aspect_ratio,
+        "protocol": "openai_image" if upscale_model in GPT_IMAGE_MODELS else "gemini",
+        "generation_mode": "manual_upscale",
+        "pipeline_stage": "manual_upscale",
+        "upscale_target_image_size": image_size,
+        "upscale_applied": True,
+        "source_model": str(summary.get("model", "") or ""),
+        "source_task_id": source_task_id,
+        "viewer_index": _safe_int(summary.get("viewer_index", 0), 0),
+        "unique_name": str(summary.get("unique_name", "") or ""),
+        "generation_round": _safe_int(summary.get("generation_round", 0), 0),
+        "output_position": _safe_int(summary.get("output_position", 0), 0),
+        "batch_index": 0,
+        "batch_num": 1,
+        "reference_image_count": 1,
+        "stage_max_wait": _ASYNC_MAX_WAIT_SECONDS,
+        "workflow_max_wait": _ASYNC_MAX_WAIT_SECONDS,
+        "prompt_preview": _prompt_preview(_render_upscale_prompt(
+            params.get("upscale_prompt", _DEFAULT_UPSCALE_PROMPT), image_size, aspect_ratio
+        )),
+    }
+
+
+def _run_manual_upscale(summary, source_path, source_key, local_job_id):
+    """Run B-stage-only upscaling and replace the host asset only after a full download succeeds."""
+    source_task_id = str(summary["task_id"])
+    gateway_task_id = local_job_id
+    prepared_cleanup = lambda: None
+    reference_slot = False
+    task_slot = False
+    delivery_slot = False
+    try:
+        source = Path(source_path)
+        original_fingerprint = _file_fingerprint(source)
+        params = _merge_runtime_params({})
+        endpoint = _normalize_endpoint(params.get("endpoint", _GATEWAY_ENDPOINT))
+        metadata = _manual_upscale_metadata(summary, params, source_task_id, source)
+        _record_async_task(
+            "manual_upscale_processing",
+            task_id=local_job_id,
+            status="processing",
+            **metadata,
+        )
+        model = metadata["model"]
+        api_key = _api_key_for_model(params, model)
+        if not api_key:
+            label = "GPT KEY" if model in GPT_IMAGE_MODELS else "GEMINI KEY"
+            raise Exception(f"未设置超分模型所需的 {label}")
+
+        _local_reference_gate.acquire(lambda: False)
+        reference_slot = True
+        _local_task_gate.acquire(lambda: False)
+        task_slot = True
+        prepared_references, prepared_cleanup = _prepare_reference_images({0: str(source)}, params)
+        prompt = _render_upscale_prompt(
+            params.get("upscale_prompt", _DEFAULT_UPSCALE_PROMPT),
+            metadata["image_size"], metadata["aspect_ratio"],
+        )
+        request_id = f"yaliai_plugin_manual_upscale_{uuid.uuid4().hex}"
+        if model in GPT_IMAGE_MODELS:
+            outputs = send_gpt_image_request(
+                api_key=api_key,
+                endpoint=endpoint,
+                model=model,
+                prompt=prompt,
+                reference_images=prepared_references,
+                aspect_ratio=metadata["aspect_ratio"],
+                image_size=metadata["image_size"],
+                quality=metadata["quality"],
+                request_timeout=_GATEWAY_HTTP_TIMEOUT_SECONDS,
+                download_timeout=_IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+                async_initial_delay=_ASYNC_INITIAL_DELAY_SECONDS,
+                async_poll_interval=_ASYNC_POLL_INTERVAL_SECONDS,
+                async_max_wait=_ASYNC_MAX_WAIT_SECONDS,
+                request_id=request_id,
+                task_metadata=metadata,
+            )
+        else:
+            outputs = send_gemini_request(
+                api_key=api_key,
+                endpoint=endpoint,
+                model=model,
+                prompt=prompt,
+                reference_images=prepared_references,
+                aspect_ratio=metadata["aspect_ratio"],
+                image_size=metadata["image_size"],
+                request_timeout=_GATEWAY_HTTP_TIMEOUT_SECONDS,
+                download_timeout=_IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+                async_initial_delay=_ASYNC_INITIAL_DELAY_SECONDS,
+                async_poll_interval=_ASYNC_POLL_INTERVAL_SECONDS,
+                async_max_wait=_ASYNC_MAX_WAIT_SECONDS,
+                request_id=request_id,
+                task_metadata=metadata,
+            )
+        if not outputs:
+            raise Exception("超分任务完成但没有返回图片")
+
+        output = outputs[0]
+        gateway_task_id = str(output.get("task_id") or gateway_task_id)
+        with tempfile.TemporaryDirectory(prefix="yaliai-manual-upscale-", dir=str(source.parent)) as staging_dir:
+            temp_context = {
+                "viewer_index": 0,
+                "unique_name": f"manual_upscale_{uuid.uuid4().hex[:12]}",
+                "generation_round": int(time.time()),
+                "output_position": [0],
+            }
+            _local_delivery_gate.acquire(lambda: False)
+            delivery_slot = True
+            try:
+                if output.get("type") == "url":
+                    output_url = _absolute_gateway_url(endpoint, output.get("value"))
+                    staged_path = download_url_to_output(
+                        output_url, temp_context, staging_dir,
+                        download_timeout=_IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+                    )
+                elif output.get("type") == "b64":
+                    output_url = ""
+                    staged_path = save_image_base64_to_output(output.get("value"), temp_context, staging_dir)
+                else:
+                    raise Exception("超分结果包含未知图片格式")
+            finally:
+                _local_delivery_gate.release()
+                delivery_slot = False
+
+            if _file_fingerprint(source) != original_fingerprint:
+                raise Exception("原图在超分期间已变化，已取消替换以避免覆盖新图片")
+            backup_dir = source.parent / ".yaliai-backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"{source.stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}{source.suffix}"
+            shutil.copy2(source, backup_path)
+            os.replace(staged_path, source)
+
+        _record_async_task(
+            "manual_upscale_replaced",
+            task_id=gateway_task_id,
+            status="success",
+            output_path=str(source.resolve()),
+            output_url=output_url,
+            output_type=output.get("type", ""),
+            backup_path=str(backup_path.resolve()),
+            **metadata,
+        )
+        _persist_task_thumbnail(gateway_task_id, source)
+        print(f"[Yali AI Image] 超分已替换: {source}")
+    except Exception as exc:
+        _record_async_task(
+            "manual_upscale_failed",
+            task_id=gateway_task_id,
+            status="failed",
+            error=str(exc),
+            source_task_id=source_task_id,
+            pipeline_stage="manual_upscale",
+            generation_mode="manual_upscale",
+        )
+        print(f"[Yali AI Image] 手动超分失败: {exc}")
+    finally:
+        try:
+            prepared_cleanup()
+        except Exception:
+            pass
+        if delivery_slot:
+            _local_delivery_gate.release()
+        if task_slot:
+            _local_task_gate.release()
+        if reference_slot:
+            _local_reference_gate.release()
+        with _manual_upscale_jobs_lock:
+            _manual_upscale_jobs.discard(source_key)
+
+
+def _start_manual_upscale(task_id):
+    summary = _find_task_log_summary(task_id)
+    if not summary:
+        return {"ok": False, "error": "未找到任务记录"}
+    upscale_state = _build_manual_upscale_states(_summarize_async_task_events(_read_async_task_events())).get(
+        str(summary.get("task_id", "")), "unavailable"
+    )
+    if upscale_state == "already_upscaled":
+        return {"ok": False, "error": "该图片已超分，不允许重复超分"}
+    if upscale_state == "superseded":
+        return {"ok": False, "error": "该任务图片已被后续结果替换，请选择最新任务"}
+    if upscale_state != "eligible":
+        return {"ok": False, "error": "仅当前未超分的成功图片可以超分"}
+    source = Path(str(summary.get("output_path", "") or ""))
+    if not source.is_file() or source.stat().st_size <= 0:
+        return {"ok": False, "error": "原图文件不存在，无法替换对应分镜"}
+    try:
+        with Image.open(source) as image:
+            image.verify()
+    except Exception as exc:
+        return {"ok": False, "error": f"原图无法读取: {exc}"}
+    source_key = str(source.resolve()).lower()
+    with _manual_upscale_jobs_lock:
+        if source_key in _manual_upscale_jobs:
+            return {"ok": False, "error": "该图片已有超分任务正在执行"}
+        _manual_upscale_jobs.add(source_key)
+    local_job_id = f"local_upscale_{uuid.uuid4().hex}"
+    try:
+        pending_params = _merge_runtime_params({})
+        pending_metadata = _manual_upscale_metadata(
+            summary, pending_params, str(summary["task_id"]), source
+        )
+        _record_async_task(
+            "manual_upscale_queued",
+            task_id=local_job_id,
+            status="queued",
+            **pending_metadata,
+        )
+    except Exception:
+        with _manual_upscale_jobs_lock:
+            _manual_upscale_jobs.discard(source_key)
+        raise
+    worker = threading.Thread(
+        target=_run_manual_upscale,
+        args=(dict(summary), str(source.resolve()), source_key, local_job_id),
+        name=f"yaliai-manual-upscale-{uuid.uuid4().hex[:8]}",
+        daemon=True,
+    )
+    worker.start()
+    return {
+        "ok": True,
+        "task_id": local_job_id,
+        "source_task_id": str(summary["task_id"]),
+        "message": "超分任务已进入队列；完成后会备份并替换当前分镜图片",
+    }
+
+
+def _start_manual_upscale_batch(task_ids):
+    if not isinstance(task_ids, (list, tuple)):
+        return {"ok": False, "error": "task_ids 必须是任务 ID 列表"}
+    unique_ids = []
+    seen = set()
+    for value in task_ids:
+        task_id = str(value or "").strip()
+        if task_id and task_id not in seen:
+            seen.add(task_id)
+            unique_ids.append(task_id)
+    if not unique_ids:
+        return {"ok": False, "error": "请先选择已交付的任务"}
+    if len(unique_ids) > _MANUAL_UPSCALE_BATCH_LIMIT:
+        return {"ok": False, "error": f"一次最多批量超分 {_MANUAL_UPSCALE_BATCH_LIMIT} 张图片"}
+
+    started = []
+    rejected = []
+    for task_id in unique_ids:
+        result = _start_manual_upscale(task_id)
+        if result.get("ok"):
+            started.append(task_id)
+        else:
+            rejected.append({"task_id": task_id, "error": result.get("error", "无法提交")})
+    if not started:
+        message = rejected[0]["error"] if rejected else "没有可提交的超分任务"
+        return {"ok": False, "error": message, "rejected": rejected}
+    return {
+        "ok": True,
+        "started": started,
+        "rejected": rejected,
+        "message": f"已提交 {len(started)} 个超分任务；将按本地并发队列执行并替换原图",
+    }
 
 
 def _new_http_session():
@@ -1049,11 +1817,13 @@ def _decode_json_response(response, label):
 
 def _submit_async_request(session, url, api_key, request_id, request_timeout, *, json_payload=None, form_data=None, files=None, task_metadata=None):
     headers = _gateway_headers(api_key, request_id)
+    submitted_at = time.monotonic()
     if json_payload is not None:
         headers["Content-Type"] = "application/json"
         response = session.post(url, headers=headers, json=json_payload, timeout=request_timeout)
     else:
         response = session.post(url, headers=headers, data=form_data, files=files, timeout=request_timeout)
+    submit_elapsed_ms = int((time.monotonic() - submitted_at) * 1000)
 
     payload = _decode_json_response(response, "鸭梨 AI 异步提交")
     if response.status_code != 202:
@@ -1075,6 +1845,7 @@ def _submit_async_request(session, url, api_key, request_id, request_timeout, *,
         request_id=request_id,
         status=payload.get("status", "queued"),
         provider="yaliai_gateway",
+        submit_elapsed_ms=submit_elapsed_ms,
         **(task_metadata or {}),
     )
     return payload
@@ -1122,7 +1893,7 @@ def _poll_async_task(session, endpoint, api_key, accepted, request_timeout, init
     query_url = _absolute_gateway_url(endpoint, query_path)
     _record_async_task("polling", task_id=task_id, query_path=query_path)
 
-    initial_delay = max(30, int(initial_delay))
+    initial_delay = max(1, int(initial_delay))
     poll_interval = max(1, int(poll_interval))
     max_wait = max(60, int(max_wait))
     progress("已提交", 15)
@@ -2207,10 +2978,11 @@ def generate(context):
     model = _normalize_model(params.get("model", "gemini-3.1-flash-image-preview"))
     api_key = _api_key_for_model(params, model)
     aspect_ratio = str(params.get("aspect_ratio", "16:9") or "16:9").strip()
-    image_size = str(params.get("image_size", "4K") or "4K").strip().upper()
+    image_size = _normalize_image_size(params.get("image_size", "4K"), "4K")
     quality = str(params.get("quality", "medium") or "medium").strip().lower()
     generation_mode = str(params.get("generation_mode", "default") or "default").strip().lower()
     upscale_model = _normalize_model(params.get("upscale_model", "gemini-3-pro-image-preview"))
+    upscale_image_size = _normalize_image_size(params.get("upscale_image_size", "4K"), "4K")
     upscale_prompt_template = str(
         params.get("upscale_prompt", _DEFAULT_UPSCALE_PROMPT) or _DEFAULT_UPSCALE_PROMPT
     ).strip()
@@ -2219,13 +2991,17 @@ def generate(context):
     initial_delay = _ASYNC_INITIAL_DELAY_SECONDS
     poll_interval = _ASYNC_POLL_INTERVAL_SECONDS
     max_wait = _ASYNC_MAX_WAIT_SECONDS
-    workflow_max_wait = max_wait * (2 if generation_mode == "upscale" else 1)
+    should_upscale = generation_mode == "upscale"
+    workflow_max_wait = max_wait * (2 if should_upscale else 1)
     batch_num = _safe_int(context.get("batch_num", 1), 1)
     if batch_num < 1 or batch_num > _MAX_BATCH_NUM:
         raise Exception(f"PLUGIN_ERROR:::batch_num 必须在 1 到 {_MAX_BATCH_NUM} 之间")
     output_positions = context.get("output_position")
     if not isinstance(output_positions, (list, tuple)):
         output_positions = []
+
+    configured_references = _configured_reference_paths()
+    reference_images = _merge_reference_images(reference_images, configured_references)
 
     if not api_key:
         credential_label = "GPT-image-2 API Key" if model in GPT_IMAGE_MODELS else "Gemini API Key"
@@ -2241,10 +3017,10 @@ def generate(context):
     if generation_mode not in {"default", "upscale"}:
         raise Exception("PLUGIN_ERROR:::生成模式必须是 default 或 upscale")
     if generation_mode == "upscale":
-        if not _api_key_for_model(params, upscale_model):
+        if should_upscale and not _api_key_for_model(params, upscale_model):
             credential_label = "GPT-image-2 API Key" if upscale_model in GPT_IMAGE_MODELS else "Gemini API Key"
             raise Exception(f"PLUGIN_ERROR:::未设置超分模型所需的 {credential_label}")
-        _render_upscale_prompt(upscale_prompt_template, image_size, aspect_ratio)
+        _render_upscale_prompt(upscale_prompt_template, upscale_image_size, aspect_ratio)
 
     os.makedirs(output_dir, exist_ok=True)
     progress_callback = context.get("progress_callback")
@@ -2279,13 +3055,18 @@ def generate(context):
     print("鸭梨 AI 图像生成插件开始异步任务")
     print("=" * 60)
     print(f"模型: {model}; 比例: {aspect_ratio}; 档位: {image_size}; 画质: {quality}; 批次: {batch_num}")
+    if generation_mode == "upscale":
+        print(f"超分规则: 基础图={image_size}; 目标={upscale_image_size}; 本次执行超分")
     print(f"参考图数量: {len(_normalize_reference_images(reference_images))}")
 
     def is_cancelled():
         return _is_cancelled(context)
 
     generated_files = [None] * batch_num
+    progress("准备参考图", 6)
+    shared_reference_prepare_started = time.monotonic()
     reference_images, cleanup_reference_images = _prepare_reference_images(reference_images, params)
+    shared_reference_prepare_ms = int((time.monotonic() - shared_reference_prepare_started) * 1000)
     reference_image_count = len(_normalize_reference_images(reference_images))
 
     def stage_progress(start_percent, end_percent):
@@ -2307,8 +3088,10 @@ def generate(context):
             "aspect_ratio": aspect_ratio,
             "protocol": "openai_image" if model in GPT_IMAGE_MODELS else "gemini",
             "generation_mode": generation_mode,
-            "pipeline_stage": "source" if generation_mode == "upscale" else "single",
-            "source_model": model if generation_mode == "upscale" else "",
+            "pipeline_stage": "source" if should_upscale else "single",
+            "upscale_target_image_size": upscale_image_size,
+            "upscale_applied": should_upscale,
+            "source_model": model if should_upscale else "",
             "source_task_id": "",
             "stage_max_wait": max_wait,
             "workflow_max_wait": workflow_max_wait,
@@ -2319,18 +3102,26 @@ def generate(context):
             "batch_index": index,
             "batch_num": batch_num,
             "reference_image_count": reference_image_count,
+            "shared_reference_prepare_ms": shared_reference_prepare_ms,
             "prompt_preview": _prompt_preview(prompt),
         }
         if is_cancelled():
             raise Exception("任务已被宿主取消")
 
-        def request_stage(stage_model, stage_prompt, stage_references, stage_request_id, stage_metadata, start_percent, end_percent):
+        def request_stage(stage_model, stage_prompt, stage_references, stage_request_id, stage_metadata, start_percent, end_percent, stage_image_size, references_prepared=False):
             if is_cancelled():
                 raise Exception("任务已被宿主取消")
-            progress("生成中", start_percent)
-            prepared_references, cleanup_stage_references = _prepare_reference_images(
-                stage_references, params, is_cancelled=is_cancelled
-            )
+            preparation_started = time.monotonic()
+            progress("准备参考图", max(6, start_percent - 2))
+            if references_prepared:
+                prepared_references, cleanup_stage_references = stage_references, (lambda: None)
+            else:
+                prepared_references, cleanup_stage_references = _prepare_reference_images(
+                    stage_references, params, is_cancelled=is_cancelled
+                )
+            stage_metadata = dict(stage_metadata)
+            stage_metadata["stage_reference_prepare_ms"] = int((time.monotonic() - preparation_started) * 1000)
+            progress("提交任务", start_percent)
             try:
                 if stage_model in GPT_IMAGE_MODELS:
                     outputs = send_gpt_image_request(
@@ -2340,7 +3131,7 @@ def generate(context):
                         prompt=stage_prompt,
                         reference_images=prepared_references,
                         aspect_ratio=aspect_ratio,
-                        image_size=image_size,
+                        image_size=stage_image_size,
                         quality=quality,
                         request_timeout=request_timeout,
                         download_timeout=download_timeout,
@@ -2360,7 +3151,7 @@ def generate(context):
                         prompt=stage_prompt,
                         reference_images=prepared_references,
                         aspect_ratio=aspect_ratio,
-                        image_size=image_size,
+                        image_size=stage_image_size,
                         request_timeout=request_timeout,
                         download_timeout=download_timeout,
                         async_initial_delay=initial_delay,
@@ -2379,7 +3170,7 @@ def generate(context):
                 print(f"警告：任务返回 {len(outputs)} 张图片；当前宿主槽位只接收第一张")
             return outputs[0]
 
-        def deliver_stage(output, target_dir, event_name, stage_metadata, target_position):
+        def deliver_stage(output, target_dir, event_name, stage_metadata, target_position, compress_result=False):
             task_id = str(output.get("task_id", "") or "")
             image_url = ""
             delivery_slot = False
@@ -2415,6 +3206,9 @@ def generate(context):
             finally:
                 if delivery_slot:
                     _local_delivery_gate.release()
+            if compress_result:
+                path = _compress_delivered_output(path, params, is_cancelled=is_cancelled)
+            _persist_task_thumbnail(task_id, path)
             _record_async_task(
                 event_name,
                 task_id=task_id,
@@ -2426,7 +3220,7 @@ def generate(context):
             )
             return path, task_id
 
-        if generation_mode == "upscale":
+        if should_upscale:
             with tempfile.TemporaryDirectory(prefix="yaliai-upscale-") as staging_dir:
                 source_output = request_stage(
                     model,
@@ -2436,6 +3230,8 @@ def generate(context):
                     source_task_metadata,
                     8 + int(index * 35 / batch_num),
                     42,
+                    image_size,
+                    references_prepared=True,
                 )
                 source_path, source_task_id = deliver_stage(
                     source_output,
@@ -2455,18 +3251,20 @@ def generate(context):
                     "source_model": model,
                     "source_task_id": source_task_id,
                     "reference_image_count": 1,
+                    "image_size": upscale_image_size,
                     "prompt_preview": _prompt_preview(_render_upscale_prompt(
-                        upscale_prompt_template, image_size, aspect_ratio
+                        upscale_prompt_template, upscale_image_size, aspect_ratio
                     )),
                 })
                 upscale_output = request_stage(
                     upscale_model,
-                    _render_upscale_prompt(upscale_prompt_template, image_size, aspect_ratio),
+                    _render_upscale_prompt(upscale_prompt_template, upscale_image_size, aspect_ratio),
                     {0: source_path},
                     _new_request_id(context, f"{position}_upscale"),
                     upscale_metadata,
                     45,
                     92,
+                    upscale_image_size,
                 )
                 final_path, _ = deliver_stage(
                     upscale_output,
@@ -2474,6 +3272,7 @@ def generate(context):
                     "delivered",
                     upscale_metadata,
                     position,
+                    compress_result=True,
                 )
         else:
             final_path, _ = deliver_stage(
@@ -2485,11 +3284,14 @@ def generate(context):
                     source_task_metadata,
                     8 + int(index * 70 / batch_num),
                     86,
+                    image_size,
+                    references_prepared=True,
                 ),
                 output_dir,
                 "delivered",
                 source_task_metadata,
                 position,
+                compress_result=True,
             )
 
         progress("完成", 86 + int((index + 1) * 14 / batch_num))
