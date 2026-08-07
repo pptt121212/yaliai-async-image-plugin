@@ -292,7 +292,6 @@
       updateUpscaleVisibility()
       if (persist && sdkReady) {
         try { PluginSDK.saveParam('generation_mode', currentGenerationMode) } catch (error) {}
-        PluginSDK.sendAction('save_param', { key: 'generation_mode', value: currentGenerationMode })
       }
     }
 
@@ -310,7 +309,6 @@
       if (!sdkReady) return
       var value = String(fields[key].value || '').trim()
       try { PluginSDK.saveParam(key, value) } catch (error) {}
-      PluginSDK.sendAction('save_param', { key: key, value: value })
     }
 
     function applyParams(params) {
@@ -366,8 +364,12 @@
     PluginSDK.onAction('load_params', function (result) { if (result && result.ok) applyParams(result.params) })
     document.getElementById('openTaskLog').addEventListener('click', function () {
       if (!sdkReady) return
-      PluginSDK.sendAction('open_task_logs').then(function (result) {
-        if (!result || result.ok === false) setStatus((result && result.error) || '无法打开任务日志', true)
+      PluginSDK.sendAction('open_task_logs', {}, { timeoutMs: 15000 }).then(function (result) {
+        // The host may create the popup before its iframe reply reaches this
+        // panel. Do not turn that completed UI action into a false failure.
+        if (result && result.ok === false && result.error !== '后端未返回插件动作结果：请确认宿主后端已启动，或稍后重试。') {
+          setStatus(result.error || '无法打开任务日志', true)
+        }
       })
     })
     referenceInput.addEventListener('change', function () {

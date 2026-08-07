@@ -104,7 +104,9 @@ class PluginContractTests(unittest.TestCase):
     def test_ui_uses_plugin_sdk_for_persistence_without_reloading_stale_config(self):
         ui_html = (PLUGIN_PATH.parent / "ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn("PluginSDK.saveParam(key, value)", ui_html)
+        self.assertNotIn("PluginSDK.sendAction('save_param'", ui_html)
         self.assertNotIn("PluginSDK.sendAction('load_params')", ui_html)
+        self.assertIn("result.error !== '后端未返回插件动作结果", ui_html)
         for action in (
             "save_param",
             "get_configured_references",
