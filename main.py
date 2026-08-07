@@ -437,18 +437,6 @@ def _normalize_reference_images(reference_images):
         "url",
         "uri",
     )
-    nested_keys = {
-        "参考图片map",
-        "参考图片_map",
-        "referenceimagemap",
-        "reference_images_map",
-        "reference_image_map",
-        "referenceimagesmap",
-    }
-
-    def key_name(value):
-        return re.sub(r"[\s_-]+", "", str(value or "").strip().lower())
-
     def scalar_path(value):
         if isinstance(value, (str, os.PathLike)):
             text = os.fspath(value).strip()
@@ -489,19 +477,10 @@ def _normalize_reference_images(reference_images):
                 append(child)
 
     if isinstance(reference_images, dict):
-        # Preserve the host's intended order: numbered reference MAP first,
-        # then explicit first/last frame or other top-level entries.
-        nested = []
-        rest = []
-        for key, value in reference_images.items():
-            normalized_key = key_name(key)
-            if normalized_key in nested_keys:
-                nested.append(value)
-            else:
-                rest.append(value)
-        for value in nested:
-            append(value)
-        for value in rest:
+        # Keep the host's top-level insertion order. A preset may interleave
+        # first/last frames with a numbered reference MAP; moving the MAP to
+        # the front changes the meaning of reference-image order.
+        for value in reference_images.values():
             append(value)
     else:
         append(reference_images)

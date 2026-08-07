@@ -105,6 +105,67 @@ class PluginContractTests(unittest.TestCase):
 
         self.assertEqual(list(normalized.values()), [first, second, third])
 
+    def test_reference_normalization_keeps_mixed_top_level_order(self):
+        references = {
+            "首帧": "first.png",
+            "参考图片MAP": {"1": "map-second.png", "0": "map-first.png"},
+            "尾帧": {"path": "last.png"},
+        }
+
+        normalized = plugin._normalize_reference_images(references)
+
+        self.assertEqual(
+            list(normalized.values()),
+            ["first.png", "map-first.png", "map-second.png", "last.png"],
+        )
+
+    def test_gemini_reference_parts_keep_reference_order(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            first = Path(source_dir) / "first.png"
+            second = Path(source_dir) / "second.png"
+            first.write_bytes(base64.b64decode(PNG_1X1))
+            second.write_bytes(base64.b64decode(PNG_1X1))
+
+            parts = plugin.build_gemini_parts(
+                "prompt",
+                {0: str(first), 1: str(second)},
+            )
+
+        self.assertEqual([part["text"] for part in parts[:1]], ["prompt"])
+        self.assertEqual(
+            [part["inlineData"]["data"] for part in parts[1:]],
+            [PNG_1X1, PNG_1X1],
+        )
+
+    def test_openai_multipart_reference_fields_keep_reference_order(self):
+        submitted = {}
+
+        def capture_submit(_session, _url, _api_key, _request_id, _timeout, **kwargs):
+            submitted.update(kwargs)
+            return {"task_id": "ordered-task", "query_path": "/v1/image/tasks/ordered-task"}
+
+        with tempfile.TemporaryDirectory() as source_dir:
+            first = Path(source_dir) / "first.png"
+            second = Path(source_dir) / "second.png"
+            first.write_bytes(base64.b64decode(PNG_1X1))
+            second.write_bytes(base64.b64decode(PNG_1X1))
+
+            with patch.object(plugin, "_submit_async_request", side_effect=capture_submit), \
+                    patch.object(plugin, "_poll_async_task", return_value=[]):
+                plugin.send_gpt_image_request(
+                    api_key="test-key",
+                    endpoint="http://gateway.invalid",
+                    model="gpt-image-2",
+                    prompt="prompt",
+                    reference_images={0: str(first), 1: str(second)},
+                    session=_Session(),
+                )
+
+        self.assertEqual(
+            [item[1][0] for item in submitted["files"]],
+            ["first.png", "second.png"],
+        )
+
     def test_reference_images_are_compressed_to_temporary_jpeg(self):
         with tempfile.TemporaryDirectory() as source_dir:
             source_path = Path(source_dir) / "reference.png"
