@@ -3,9 +3,8 @@
 鸭梨 AI 图像生成插件
 
 参数同步：
-- 首次加载时在 main.py 同级自动创建 config.json
-- 前端 sendAction('save_param') 写入
-- 前端 sendAction('load_params') 读取
+- 在字字动画中运行时，配置和插件状态保存在 user_resources/plugins/
+- 前端通过 PluginSDK.saveParam() 持久化普通参数
 - generate() 合并默认值、运行配置和当前宿主调用参数
 
 支持：
@@ -48,14 +47,36 @@ _PLUGIN_FILE = __file__
 plugin_dir = Path(__file__).parent
 
 
-# ===================== 自管理配置文件 =====================
+# ===================== 插件状态目录 =====================
 
-_CONFIG_PATH = plugin_dir / "config.json"
-_CONFIGURED_REFERENCE_DIR = plugin_dir / "configured_references"
+def _resolve_state_dir():
+    """Keep user data outside the installed plugin directory when hosted.
+
+    A distributed plugin lives below ``_internal/plugins``. The host reserves
+    its sibling ``user_resources/plugins`` tree for mutable user data, which
+    survives plugin upgrades and is also the source for ``plugin_params``.
+    Standalone tests retain the plugin-local fallback.
+    """
+    try:
+        internal_dir = plugin_dir.parents[2]
+        if internal_dir.name == "_internal":
+            app_dir = internal_dir.parent
+            user_resources = app_dir / "user_resources"
+            if user_resources.is_dir():
+                return user_resources / "plugins" / plugin_dir.parent.name / plugin_dir.name
+    except IndexError:
+        pass
+    return plugin_dir
+
+
+_LEGACY_STATE_DIR = plugin_dir
+_STATE_DIR = _resolve_state_dir()
+_CONFIG_PATH = _STATE_DIR / "config.json"
+_CONFIGURED_REFERENCE_DIR = _STATE_DIR / "configured_references"
 _config_lock = threading.Lock()
-_ASYNC_TASK_LOG_PATH = plugin_dir / "async_tasks.jsonl"
+_ASYNC_TASK_LOG_PATH = _STATE_DIR / "async_tasks.jsonl"
 _async_task_log_lock = threading.Lock()
-_TASK_THUMBNAIL_DIR = plugin_dir / "task_thumbnails"
+_TASK_THUMBNAIL_DIR = _STATE_DIR / "task_thumbnails"
 _manual_upscale_jobs_lock = threading.Lock()
 _manual_upscale_jobs = set()
 _GATEWAY_ENDPOINT = "https://api.yaliai.com"
@@ -85,6 +106,26 @@ def _load_config():
             return {}
 
 
+def _migrate_legacy_state():
+    """Move pre-user_resources state once without replacing current data."""
+    if _STATE_DIR == _LEGACY_STATE_DIR:
+        return
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        for name in ("config.json", "async_tasks.jsonl"):
+            legacy = _LEGACY_STATE_DIR / name
+            target = _STATE_DIR / name
+            if legacy.is_file() and not target.exists():
+                shutil.copy2(legacy, target)
+        for name in ("configured_references", "task_thumbnails"):
+            legacy = _LEGACY_STATE_DIR / name
+            target = _STATE_DIR / name
+            if legacy.is_dir() and not target.exists():
+                shutil.copytree(legacy, target)
+    except Exception as error:
+        print(f"[Yali AI Image] 迁移旧插件状态失败: {error}")
+
+
 def _save_config(params):
     if not isinstance(params, dict):
         return False
@@ -112,8 +153,10 @@ def _save_config(params):
                 existing.pop(retired_key, None)
             _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            tmp_path = _CONFIG_PATH.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, _CONFIG_PATH)
 
             return True
 
@@ -509,7 +552,10 @@ def _save_configured_references(images):
     if not isinstance(images, list) or len(images) > 8:
         return {"ok": False, "error": "参考图最多 8 张"}
 
-    staging_dir = Path(tempfile.mkdtemp(prefix="configured-references-", dir=str(plugin_dir)))
+    _CONFIGURED_REFERENCE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(
+        prefix="configured-references-", dir=str(_CONFIGURED_REFERENCE_DIR.parent)
+    ))
     saved = []
     try:
         _CONFIGURED_REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
@@ -553,7 +599,7 @@ def _save_configured_references(images):
             if old.is_file():
                 old.unlink()
         for source in saved:
-            source.replace(_CONFIGURED_REFERENCE_DIR / source.name)
+            shutil.move(str(source), str(_CONFIGURED_REFERENCE_DIR / source.name))
         paths = [str((_CONFIGURED_REFERENCE_DIR / source.name).resolve()) for source in saved]
         if not _save_config({"configured_reference_images": paths}):
             raise RuntimeError("参考图配置保存失败")
@@ -561,7 +607,6 @@ def _save_configured_references(images):
     except Exception as exc:
         return {"ok": False, "error": f"参考图保存失败: {exc}"}
     finally:
-        import shutil
         shutil.rmtree(staging_dir, ignore_errors=True)
 
 
@@ -1165,7 +1210,7 @@ def load_params(params):
     print("[Yali AI Image] load_params 已更新内存参数")
 
 
-def handle_action(action, data=None):
+def handle_action(action, data=None, context=None):
     global _global_params
 
     if data is None:
@@ -1193,14 +1238,13 @@ def handle_action(action, data=None):
         if key is None:
             return {"ok": False, "error": "缺少 key"}
 
-        ok = _save_single_param(key, value)
-
-        if ok:
-            if key == "model":
-                value = _normalize_model(value)
-            _global_params[key] = value
-
-        return {"ok": ok}
+        # Normal iframe settings are persisted by PluginSDK.saveParam().
+        # This bridge only keeps the currently loaded plugin module in sync;
+        # writing a second config snapshot here can race with the host writer.
+        if key == "model":
+            value = _normalize_model(value)
+        _global_params[key] = value
+        return {"ok": True}
 
     elif action == "save_all_params":
         params = data.get("params", {})
@@ -1208,15 +1252,11 @@ def handle_action(action, data=None):
         if not isinstance(params, dict):
             return {"ok": False, "error": "params 必须是 dict"}
 
-        ok = _save_config(params)
-
-        if ok:
-            if "model" in params:
-                params = dict(params)
-                params["model"] = _normalize_model(params.get("model"))
-            _global_params.update(params)
-
-        return {"ok": ok}
+        if "model" in params:
+            params = dict(params)
+            params["model"] = _normalize_model(params.get("model"))
+        _global_params.update(params)
+        return {"ok": True}
 
     elif action == "load_params":
         return {"ok": True, "params": _load_config()}
@@ -3542,9 +3582,11 @@ def generate(context):
 
 # ===================== 初始化 =====================
 
+_migrate_legacy_state()
 _ensure_config_exists()
 
 print("[Yali AI Image] 插件已加载")
+print(f"[Yali AI Image] 状态目录: {_STATE_DIR}")
 print(f"[Yali AI Image] 配置文件: {_CONFIG_PATH}")
 print(f"[Yali AI Image] 配置文件存在: {_CONFIG_PATH.exists()}")
 

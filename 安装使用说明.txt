@@ -31,7 +31,7 @@
 4. “打开任务日志”可查看模式、模型、档位、比例、画质、提示词预览、状态和结果图片。
 
 五、配置与隐私
-1. 第一次启动后，插件目录会自动生成 config.json；API Key 只保存在本机配置中。
+1. 第一次启动后，配置保存在工具的 user_resources\plugins\image_plugins\yaliai-async-image-plugin\config.json；API Key 只保存在本机配置中。
 2. async_tasks.jsonl 是本机任务日志，不包含完整提示词和图片 Base64。
 3. 分发插件时不要携带 config.json、async_tasks.jsonl 或 __pycache__ 文件夹；它们会在运行时自动生成。
 4. 任务日志页面的清理操作只清理任务记录，不删除工具已经保存的结果图片。

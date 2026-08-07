@@ -365,7 +365,10 @@
     })
     PluginSDK.onAction('load_params', function (result) { if (result && result.ok) applyParams(result.params) })
     document.getElementById('openTaskLog').addEventListener('click', function () {
-      if (sdkReady) PluginSDK.sendAction('open_task_logs')
+      if (!sdkReady) return
+      PluginSDK.sendAction('open_task_logs').then(function (result) {
+        if (!result || result.ok === false) setStatus((result && result.error) || '无法打开任务日志', true)
+      })
     })
     referenceInput.addEventListener('change', function () {
       var files = Array.prototype.slice.call(referenceInput.files || [])
@@ -379,14 +382,29 @@
     document.getElementById('clearReferenceImages').addEventListener('click', function () {
       if (!sdkReady) return
       PluginSDK.sendAction('clear_configured_references', {}, { timeoutMs: 10000 }).then(function (result) {
+        if (!result || result.ok === false) throw new Error((result && result.error) || '清空参考图失败')
         renderReferenceList(result && result.images)
         setStatus('已清空参考图，后续请求不携带参考图', false)
-      })
+      }).catch(function (error) { setStatus(error.message || '清空参考图失败', true) })
+    })
+    PluginSDK.onAction('save_param', function (result) {
+      if (result && result.ok === false) setStatus(result.error || '配置保存失败', true)
+    })
+    PluginSDK.onAction('get_configured_references', function (result) {
+      if (result && result.ok) renderReferenceList(result.images)
+    })
+    PluginSDK.onAction('save_configured_references', function (result) {
+      if (result && result.ok) renderReferenceList(result.images)
+    })
+    PluginSDK.onAction('clear_configured_references', function (result) {
+      if (result && result.ok) renderReferenceList(result.images)
+    })
+    PluginSDK.onAction('open_task_logs', function (result) {
+      if (result && result.ok === false) setStatus(result.error || '无法打开任务日志', true)
     })
     PluginSDK.onReady(function (params) {
       sdkReady = true
       applyParams(params)
-      PluginSDK.sendAction('load_params')
       refreshReferenceList().catch(function () { renderReferenceList([]) })
     })
   </script>

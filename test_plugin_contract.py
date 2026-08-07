@@ -87,6 +87,70 @@ class _DownloadSession:
 
 
 class PluginContractTests(unittest.TestCase):
+    def test_host_state_uses_the_official_user_resources_location(self):
+        original_dir = plugin.plugin_dir
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir) / "TypeTale"
+                plugin.plugin_dir = app_dir / "_internal" / "plugins" / "image_plugins" / "yaliai-async-image-plugin"
+                (app_dir / "user_resources").mkdir(parents=True)
+                self.assertEqual(
+                    plugin._resolve_state_dir(),
+                    app_dir / "user_resources" / "plugins" / "image_plugins" / "yaliai-async-image-plugin",
+                )
+        finally:
+            plugin.plugin_dir = original_dir
+
+    def test_ui_uses_plugin_sdk_for_persistence_without_reloading_stale_config(self):
+        ui_html = (PLUGIN_PATH.parent / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("PluginSDK.saveParam(key, value)", ui_html)
+        self.assertNotIn("PluginSDK.sendAction('load_params')", ui_html)
+        for action in (
+            "save_param",
+            "get_configured_references",
+            "save_configured_references",
+            "clear_configured_references",
+            "open_task_logs",
+        ):
+            self.assertIn(f"PluginSDK.onAction('{action}'", ui_html)
+
+    def test_handle_action_accepts_host_context_argument(self):
+        original_params = dict(plugin._global_params)
+        try:
+            result = plugin.handle_action("save_param", {"key": "model", "value": "gpt-image2-Pro"}, {})
+            self.assertTrue(result["ok"])
+            self.assertEqual(plugin._global_params["model"], "gpt-image-2")
+        finally:
+            plugin._global_params.clear()
+            plugin._global_params.update(original_params)
+
+    def test_configured_references_persist_and_clear_from_plugin_state(self):
+        original_config_path = plugin._CONFIG_PATH
+        original_reference_dir = plugin._CONFIGURED_REFERENCE_DIR
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                state_dir = Path(temp_dir) / "user_resources" / "plugins" / "image_plugins" / "plugin"
+                plugin._CONFIG_PATH = state_dir / "config.json"
+                plugin._CONFIGURED_REFERENCE_DIR = state_dir / "configured_references"
+                data_url = "data:image/png;base64," + PNG_1X1
+                saved = plugin.handle_action("save_configured_references", {
+                    "images": [{"name": "reference.png", "data_url": data_url}],
+                })
+                self.assertTrue(saved["ok"])
+                self.assertEqual(len(saved["images"]), 1)
+                saved_path = Path(saved["images"][0]["path"])
+                self.assertTrue(saved_path.is_file())
+                self.assertTrue(saved_path.is_relative_to(plugin._CONFIGURED_REFERENCE_DIR))
+                self.assertEqual(plugin._configured_reference_paths(), [str(saved_path)])
+
+                cleared = plugin.handle_action("clear_configured_references")
+                self.assertTrue(cleared["ok"])
+                self.assertFalse(saved_path.exists())
+                self.assertEqual(plugin._configured_reference_paths(), [])
+            finally:
+                plugin._CONFIG_PATH = original_config_path
+                plugin._CONFIGURED_REFERENCE_DIR = original_reference_dir
+
     def test_reference_normalization_supports_host_preset_shapes(self):
         with tempfile.TemporaryDirectory() as source_dir:
             first = str(Path(source_dir) / "first.png")
