@@ -59,6 +59,7 @@ _TASK_THUMBNAIL_DIR = plugin_dir / "task_thumbnails"
 _manual_upscale_jobs_lock = threading.Lock()
 _manual_upscale_jobs = set()
 _GATEWAY_ENDPOINT = "https://api.yaliai.com"
+_OPENAI_IMAGE_OUTPUT_FORMAT = "jpeg"
 _DEFAULT_UPSCALE_PROMPT = (
     "现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。"
     "请将图像精细度和文字边缘细节提升至 {image_size} 电影级分辨率。"
@@ -2870,6 +2871,7 @@ def send_gpt_image_request(
     aspect_ratio="1:1",
     image_size="1K",
     quality="medium",
+    output_format=_OPENAI_IMAGE_OUTPUT_FORMAT,
     request_timeout=300,
     download_timeout=300,
     async_initial_delay=30,
@@ -2884,6 +2886,11 @@ def send_gpt_image_request(
     """Submit OpenAI Images JSON/multipart input to the durable async API."""
     endpoint = _normalize_endpoint(endpoint)
     size = build_gpt_image_size(aspect_ratio, image_size)
+    output_format = str(output_format or _OPENAI_IMAGE_OUTPUT_FORMAT).strip().lower()
+    if output_format == "jpg":
+        output_format = "jpeg"
+    if output_format not in {"jpeg", "png", "webp"}:
+        raise Exception("OpenAI Images output_format 必须是 jpeg、png 或 webp")
     submission_metadata = dict(task_metadata or {})
     submission_metadata["request_size"] = size
     ref_pack = _collect_valid_reference_images(reference_images)
@@ -2900,6 +2907,7 @@ def send_gpt_image_request(
         "quality": quality,
         "n": 1,
         "response_format": "url",
+        "output_format": output_format,
         "async": True,
     }
     files = []

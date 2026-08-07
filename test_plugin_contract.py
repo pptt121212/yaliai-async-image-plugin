@@ -165,6 +165,28 @@ class PluginContractTests(unittest.TestCase):
             [item[1][0] for item in submitted["files"]],
             ["first.png", "second.png"],
         )
+        self.assertEqual(submitted["form_data"]["output_format"], "jpeg")
+
+    def test_openai_generation_json_requests_jpeg_output(self):
+        submitted = {}
+
+        def capture_submit(_session, _url, _api_key, _request_id, _timeout, **kwargs):
+            submitted.update(kwargs)
+            return {"task_id": "jpeg-task", "query_path": "/v1/image/tasks/jpeg-task"}
+
+        with patch.object(plugin, "_submit_async_request", side_effect=capture_submit), \
+                patch.object(plugin, "_poll_async_task", return_value=[]):
+            plugin.send_gpt_image_request(
+                api_key="test-key",
+                endpoint="http://gateway.invalid",
+                model="gpt-image-2",
+                prompt="prompt",
+                reference_images={},
+                session=_Session(),
+            )
+
+        self.assertEqual(submitted["json_payload"]["output_format"], "jpeg")
+        self.assertEqual(submitted["json_payload"]["response_format"], "url")
 
     def test_reference_images_are_compressed_to_temporary_jpeg(self):
         with tempfile.TemporaryDirectory() as source_dir:
