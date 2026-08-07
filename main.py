@@ -829,24 +829,22 @@ def _compress_delivered_output(path, params, is_cancelled=lambda: False):
         _local_reference_compression_gate.acquire(is_cancelled)
         try:
             with tempfile.TemporaryDirectory(prefix="yaliai-result-compress-", dir=str(source.parent)) as staging_dir:
-                compressed_path = _compress_reference_file(
+                compressed_path = _compress_delivered_image_file(
                     str(source),
                     staging_dir,
                     target_bytes,
                     is_cancelled=is_cancelled,
-                    compress_threshold_bytes=target_bytes,
                 )
                 if os.path.abspath(compressed_path) == os.path.abspath(str(source)):
                     return str(source)
-                destination = source.with_suffix(".jpg")
-                os.replace(compressed_path, destination)
-                if source != destination:
-                    source.unlink(missing_ok=True)
+                # Keep the host-visible path stable. The host may already hold
+                # this exact path for a storyboard, character, or scene image.
+                os.replace(compressed_path, source)
                 print(
-                    f"[Yali AI Image] 本地结果已压缩: {source.name} -> {destination.name} "
-                    f"({destination.stat().st_size / 1024 / 1024:.2f} MB)"
+                    f"[Yali AI Image] 本地结果已压缩并替换: {source.name} "
+                    f"({source.stat().st_size / 1024 / 1024:.2f} MB)"
                 )
-                return str(destination)
+                return str(source)
         finally:
             _local_reference_compression_gate.release()
     except Exception as exc:
@@ -854,6 +852,102 @@ def _compress_delivered_output(path, params, is_cancelled=lambda: False):
         # optimization must never discard that successful result.
         print(f"[Yali AI Image] 本地结果压缩跳过: {exc}")
         return str(source)
+
+
+def _encode_delivered_image(image, image_format, quality):
+    """Encode a result without changing its file format."""
+    output = BytesIO()
+    normalized_format = str(image_format or "").upper()
+    if normalized_format == "PNG":
+        image.save(output, "PNG", optimize=True, compress_level=9)
+    elif normalized_format in {"JPEG", "JPG"}:
+        output = BytesIO(_encode_reference_jpeg(image, quality))
+    elif normalized_format == "WEBP":
+        converted = image
+        if image.mode not in {"RGB", "RGBA"}:
+            converted = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+        try:
+            converted.save(output, "WEBP", quality=quality, method=6)
+        finally:
+            if converted is not image:
+                converted.close()
+    else:
+        raise ValueError(f"不支持保留的图片格式: {normalized_format or 'unknown'}")
+    return output.getvalue()
+
+
+def _compress_delivered_image_file(path, staging_dir, max_target_bytes, is_cancelled=lambda: False):
+    """Compress an output in place while retaining PNG/JPEG/WebP and its path."""
+    source = os.path.abspath(str(path))
+    source_size = os.path.getsize(source)
+    with Image.open(source) as opened:
+        image_format = str(opened.format or "").upper()
+        if image_format not in {"PNG", "JPEG", "JPG", "WEBP"}:
+            raise ValueError(f"不支持保留的图片格式: {image_format or 'unknown'}")
+        image = ImageOps.exif_transpose(opened)
+        image.load()
+
+    width, height = image.size
+    if width < 1 or height < 1:
+        image.close()
+        raise ValueError("生成图片尺寸无效")
+
+    target_bytes = _reference_target_bytes_for_pixels(max_target_bytes, width * height)
+    current_width, current_height = width, height
+    needs_resize = (
+        max(width, height) > _REFERENCE_IMAGE_MAX_LONG_EDGE
+        or width * height > _REFERENCE_IMAGE_SOFT_PIXELS
+    )
+    if needs_resize:
+        scale = min(1.0, _REFERENCE_IMAGE_MAX_LONG_EDGE / max(width, height))
+        if width * height > _REFERENCE_IMAGE_MAX_PIXELS:
+            scale = min(scale, (_REFERENCE_IMAGE_MAX_PIXELS / (width * height)) ** 0.5)
+        current_width = max(1, int(round(width * scale)))
+        current_height = max(1, int(round(height * scale)))
+
+    qualities = (92, 90, 88, 86, 84) if source_size / max(1, width * height) >= 2.5 else (90, 88, 86, 84, 82)
+    best = None
+    try:
+        for _ in range(6):
+            if is_cancelled():
+                raise Exception("任务已被宿主取消；本地结果压缩已停止")
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            candidate_image = image.resize(
+                (current_width, current_height), resampling
+            ) if (current_width, current_height) != (width, height) else image.copy()
+            try:
+                candidates = []
+                encode_qualities = (90,) if image_format == "PNG" else qualities
+                for quality in encode_qualities:
+                    candidate = _encode_delivered_image(candidate_image, image_format, quality)
+                    candidates.append(candidate)
+                    if best is None or len(candidate) < len(best):
+                        best = candidate
+                    if len(candidate) <= target_bytes:
+                        break
+            finally:
+                candidate_image.close()
+            if candidates and len(candidates[-1]) <= target_bytes:
+                break
+            if max(current_width, current_height) <= _REFERENCE_IMAGE_MIN_LONG_EDGE:
+                break
+            size_ratio = (
+                (target_bytes / max(1, len(best))) ** 0.5 * 0.96
+                if best
+                else 0.72
+            )
+            size_ratio = max(0.55, min(0.90, size_ratio))
+            current_width = max(1, int(current_width * size_ratio))
+            current_height = max(1, int(current_height * size_ratio))
+    finally:
+        image.close()
+
+    if not best or len(best) > target_bytes:
+        raise ValueError(f"本地结果压缩失败: {os.path.basename(source)}")
+    output_path = os.path.join(staging_dir, os.path.basename(source))
+    with open(output_path, "wb") as output:
+        output.write(best)
+    return output_path
 
 
 def _manual_replacement_format(suffix):

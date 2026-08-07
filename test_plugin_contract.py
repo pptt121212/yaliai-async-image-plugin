@@ -199,6 +199,43 @@ class PluginContractTests(unittest.TestCase):
             finally:
                 cleanup()
 
+    def test_delivered_result_replaces_host_file_without_changing_png_path(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            source_path = Path(source_dir) / "storyboard.png"
+            with Image.new("RGBA", (5000, 3000), (20, 80, 140, 255)) as image:
+                image.save(source_path, "PNG")
+            source_path.write_bytes(source_path.read_bytes() + b"x" * (2 * 1024 * 1024))
+
+            result_path = plugin._compress_delivered_output(
+                source_path,
+                {"local_result_max_mb": 1},
+            )
+
+            self.assertEqual(result_path, str(source_path))
+            self.assertTrue(source_path.exists())
+            self.assertLessEqual(source_path.stat().st_size, 1 * 1024 * 1024)
+            self.assertFalse(source_path.with_suffix(".jpg").exists())
+            with Image.open(source_path) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertEqual(image.size, (4096, 2458))
+
+    def test_delivered_result_preserves_jpeg_and_webp_formats(self):
+        for extension, image_format in ((".jpg", "JPEG"), (".webp", "WEBP")):
+            with self.subTest(extension=extension), tempfile.TemporaryDirectory() as source_dir:
+                source_path = Path(source_dir) / f"generated{extension}"
+                with Image.new("RGB", (2400, 1600), (120, 80, 40)) as image:
+                    image.save(source_path, image_format)
+                source_path.write_bytes(source_path.read_bytes() + b"x" * (2 * 1024 * 1024))
+
+                result_path = plugin._compress_delivered_output(
+                    source_path,
+                    {"local_result_max_mb": 1},
+                )
+
+                self.assertEqual(result_path, str(source_path))
+                with Image.open(source_path) as image:
+                    self.assertEqual(image.format, "JPEG" if extension == ".jpg" else "WEBP")
+
     def test_large_reference_is_compressed_instead_of_rejected(self):
         with tempfile.TemporaryDirectory() as source_dir:
             source_path = Path(source_dir) / "large.png"
@@ -468,7 +505,7 @@ class PluginContractTests(unittest.TestCase):
     def test_task_log_popup_groups_events_and_can_clear(self):
         task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
         self.assertNotIn("分镜 / 输出", task_log_html)
-        self.assertIn("generation_mode === 'upscale' ? '超分' : '默认'", task_log_html)
+        self.assertIn("var mode = task.generation_mode === 'upscale'", task_log_html)
         self.assertIn('.model { width: 175px;', task_log_html)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"
