@@ -87,6 +87,24 @@ class _DownloadSession:
 
 
 class PluginContractTests(unittest.TestCase):
+    def test_reference_normalization_supports_host_preset_shapes(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            first = str(Path(source_dir) / "first.png")
+            second = str(Path(source_dir) / "second.png")
+            third = str(Path(source_dir) / "third.png")
+            references = {
+                "参考图片MAP": {
+                    "1": {"path": second},
+                    "0": first,
+                },
+                "首帧": {"image_path": first},
+                "尾帧": {"file_path": third},
+            }
+
+            normalized = plugin._normalize_reference_images(references)
+
+        self.assertEqual(list(normalized.values()), [first, second, third])
+
     def test_reference_images_are_compressed_to_temporary_jpeg(self):
         with tempfile.TemporaryDirectory() as source_dir:
             source_path = Path(source_dir) / "reference.png"

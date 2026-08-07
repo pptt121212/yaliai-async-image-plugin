@@ -418,16 +418,106 @@ def _api_key_for_model(params, model):
 
 
 def _normalize_reference_images(reference_images):
+    """Flatten the host's reference-image shapes into an ordered path map.
+
+    The editor normally sends ``{index: path}``, but preset images can also
+    arrive as a list, a nested reference map, or objects containing ``path``
+    / ``image_path``. Keeping this normalization at the boundary prevents a
+    dict from being stringified and silently omitted by every protocol adapter.
+    """
     if not reference_images:
         return {}
 
+    path_keys = (
+        "path",
+        "file_path",
+        "image_path",
+        "local_path",
+        "source_path",
+        "url",
+        "uri",
+    )
+    nested_keys = {
+        "参考图片map",
+        "参考图片_map",
+        "referenceimagemap",
+        "reference_images_map",
+        "reference_image_map",
+        "referenceimagesmap",
+    }
+
+    def key_name(value):
+        return re.sub(r"[\s_-]+", "", str(value or "").strip().lower())
+
+    def scalar_path(value):
+        if isinstance(value, (str, os.PathLike)):
+            text = os.fspath(value).strip()
+            return text or None
+        if isinstance(value, dict):
+            for key in path_keys:
+                candidate = value.get(key)
+                if isinstance(candidate, (str, os.PathLike)):
+                    text = os.fspath(candidate).strip()
+                    if text:
+                        return text
+        return None
+
+    values = []
+
+    def ordered_mapping_values(mapping):
+        indexed = list(enumerate(mapping.items()))
+
+        def sort_key(item):
+            order, (key, _) = item
+            text = str(key).strip()
+            if re.fullmatch(r"\d+", text):
+                return (0, int(text), order)
+            return (1, order, order)
+
+        return [value for _, (_, value) in sorted(indexed, key=sort_key)]
+
+    def append(value):
+        path = scalar_path(value)
+        if path:
+            values.append(path)
+            return
+        if isinstance(value, dict):
+            for child in ordered_mapping_values(value):
+                append(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                append(child)
+
     if isinstance(reference_images, dict):
-        return reference_images
+        # Preserve the host's intended order: numbered reference MAP first,
+        # then explicit first/last frame or other top-level entries.
+        nested = []
+        rest = []
+        for key, value in reference_images.items():
+            normalized_key = key_name(key)
+            if normalized_key in nested_keys:
+                nested.append(value)
+            else:
+                rest.append(value)
+        for value in nested:
+            append(value)
+        for value in rest:
+            append(value)
+    else:
+        append(reference_images)
 
-    if isinstance(reference_images, list):
-        return {idx: value for idx, value in enumerate(reference_images)}
-
-    return {}
+    result = {}
+    seen = set()
+    for path in values:
+        if path.lower().startswith(("http://", "https://")):
+            dedupe_key = path
+        else:
+            dedupe_key = os.path.normcase(os.path.abspath(path))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result[len(result)] = path
+    return result
 
 
 def _collect_valid_reference_images(reference_images, max_images=8):
