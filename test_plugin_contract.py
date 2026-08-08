@@ -869,7 +869,7 @@ class PluginContractTests(unittest.TestCase):
     def test_task_log_does_not_open_local_images_from_popup(self):
         task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
         self.assertIn("important-notice", task_log_html)
-        self.assertIn("建议生成这三类图片时直接在插件中选择“超分”模式", task_log_html)
+        self.assertIn("避免在此页面操作超分导致软件界面无法查看最新效果", task_log_html)
         self.assertIn("local-copy-btn", task_log_html)
         self.assertIn("data-copy-local-path", task_log_html)
         self.assertNotIn("open_local_task_image", task_log_html)
