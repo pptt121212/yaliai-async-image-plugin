@@ -160,6 +160,52 @@ class PluginContractTests(unittest.TestCase):
             ])
             self.assertEqual(calls[1][1]["arguments"]["image_path"], str(source.resolve()))
 
+    def test_manual_upscale_storyboard_refresh_accepts_new_jpeg_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "panel.png"
+            replacement = Path(temp_dir) / "panel.jpg"
+            source.write_bytes(base64.b64decode(PNG_1X1))
+            with Image.new("RGB", (1, 1), (0, 0, 0)) as image:
+                image.save(replacement, "JPEG")
+            responses = [
+                {"images": [{"path": str(source), "version": 10}], "selected_index": 0},
+                {"image_index": 0},
+                {"images": [{"path": str(replacement), "version": 11}], "selected_index": 0},
+            ]
+
+            with patch.object(plugin, "_call_host_tool", side_effect=responses) as host_call:
+                result = plugin._refresh_host_image_after_manual_upscale(
+                    replacement, "panel-a", expected_source=source
+                )
+
+            self.assertEqual(result["state"], "refreshed")
+            self.assertEqual(result["path"], str(replacement))
+            self.assertEqual(host_call.call_args_list[1].args, ("zzdh_import_image_from_path", {
+                "unique_name": "panel-a", "image_path": str(replacement.resolve()),
+            }))
+
+    def test_storyboard_probe_requires_exact_selected_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "panel.png"
+            source.write_bytes(base64.b64decode(PNG_1X1))
+            with patch.object(plugin, "_call_host_tool", return_value={
+                "images": [{"path": str(source), "version": 10}], "selected_index": 0,
+            }):
+                result = plugin._probe_host_storyboard_source(source, "panel-a")
+            self.assertTrue(result["is_storyboard"])
+
+    def test_entity_or_unknown_manual_target_keeps_original_format(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "entity.png"
+            source.write_bytes(base64.b64decode(PNG_1X1))
+            with patch.object(plugin, "_call_host_tool", side_effect=RuntimeError("not a panel")):
+                probe = plugin._probe_host_storyboard_source(source, "entity-1")
+            self.assertFalse(probe["is_storyboard"])
+            staged = plugin._compress_manual_replacement_output(
+                source, source.suffix, {"local_result_max_mb": 1}
+            )
+            self.assertEqual(Path(staged).suffix, ".png")
+
     def test_manual_upscale_does_not_refresh_a_newer_host_asset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "panel.png"

@@ -1025,7 +1025,9 @@ def _compress_delivered_image_file(
     return output_path
 
 
-def _manual_replacement_format(suffix):
+def _manual_replacement_format(suffix, output_format="original"):
+    if str(output_format or "original").strip().lower() in {"jpg", "jpeg"}:
+        return ".jpg", "JPEG"
     normalized = str(suffix or "").lower()
     Image.init()
     common_formats = {
@@ -1060,10 +1062,16 @@ def _encode_manual_replacement_image(image, image_format):
     return buffer.getvalue()
 
 
-def _compress_manual_replacement_output(path, original_suffix, params, is_cancelled=lambda: False):
-    """Fit a manual replacement under its limit while retaining the host's original format."""
+def _compress_manual_replacement_output(
+    path,
+    original_suffix,
+    params,
+    is_cancelled=lambda: False,
+    output_format="original",
+):
+    """Fit a manual replacement while honoring the target's format policy."""
     source = Path(path)
-    target_suffix, image_format = _manual_replacement_format(original_suffix)
+    target_suffix, image_format = _manual_replacement_format(original_suffix, output_format)
     target_bytes = _local_result_target_bytes(params)
     needs_reencode = source.suffix.lower() != target_suffix
     if not source.is_file() or (source.stat().st_size <= target_bytes and not needs_reencode):
@@ -1417,6 +1425,7 @@ def _summarize_async_task_events(events):
             "host_frame_path": "",
             "local_image_format": "",
             "local_image_size_bytes": 0,
+            "manual_replacement_mode": "",
         })
         summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
         summary["updated_at"] = max(summary["updated_at"], timestamp)
@@ -1432,6 +1441,7 @@ def _summarize_async_task_events(events):
             "backup_path", "host_refresh_state", "host_refresh_reason", "host_refresh_image_index",
             "host_refresh_image_version", "host_frame", "host_frame_path",
             "local_image_format", "local_image_size_bytes",
+            "manual_replacement_mode",
         ):
             if event.get(key) not in (None, ""):
                 summary[key] = event[key]
@@ -1797,7 +1807,32 @@ def _call_host_tool(name, arguments):
     return payload
 
 
-def _refresh_host_image_after_manual_upscale(source, unique_name):
+def _probe_host_storyboard_source(source, unique_name):
+    """Read-only check that a task path is the currently selected storyboard image."""
+    source = Path(source)
+    unique_name = str(unique_name or "").strip()
+    if not unique_name or not source.is_file():
+        return {"is_storyboard": False, "reason": "缺少分镜标识或源文件"}
+    try:
+        before = _call_host_tool("zzdh_get_edit_view_data", {"unique_name": unique_name})
+        images = before.get("images")
+        selected_index = _safe_int(before.get("selected_index", -1), -1)
+        if not isinstance(images, list) or selected_index < 0 or selected_index >= len(images):
+            return {"is_storyboard": False, "reason": "宿主未找到当前选中图片"}
+        selected = images[selected_index] if isinstance(images[selected_index], dict) else {}
+        selected_path = selected.get("path", "")
+        if not _same_local_path(selected_path, source):
+            return {"is_storyboard": False, "reason": "分镜当前图片路径已变化"}
+        return {
+            "is_storyboard": True,
+            "selected_index": selected_index,
+            "selected_path": str(selected_path or ""),
+        }
+    except Exception as exc:
+        return {"is_storyboard": False, "reason": str(exc)}
+
+
+def _refresh_host_image_after_manual_upscale(source, unique_name, expected_source=None):
     """Refresh only the host's still-selected source asset after an in-place replacement.
 
     ``zzdh_import_image_from_path`` is the documented host operation that updates
@@ -1806,6 +1841,7 @@ def _refresh_host_image_after_manual_upscale(source, unique_name):
     slot. Requiring an exact match with the selected asset avoids that race.
     """
     source = Path(source)
+    expected_source = Path(expected_source) if expected_source else source
     unique_name = str(unique_name or "").strip()
     if not unique_name:
         return {"state": "skipped", "reason": "任务缺少分镜标识"}
@@ -1820,7 +1856,7 @@ def _refresh_host_image_after_manual_upscale(source, unique_name):
             return {"state": "skipped", "reason": "宿主未找到当前选中图片"}
         selected = images[selected_index] if isinstance(images[selected_index], dict) else {}
         selected_path = selected.get("path", "")
-        if not _same_local_path(selected_path, source):
+        if not _same_local_path(selected_path, expected_source):
             return {
                 "state": "skipped",
                 "reason": "分镜当前图片已变化，未覆盖后续结果",
@@ -1922,6 +1958,11 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
         params = _merge_runtime_params({})
         endpoint = _normalize_endpoint(params.get("endpoint", _GATEWAY_ENDPOINT))
         metadata = _manual_upscale_metadata(summary, params, source_task_id, source)
+        storyboard_probe = _probe_host_storyboard_source(
+            source, metadata.get("unique_name")
+        )
+        is_storyboard = bool(storyboard_probe.get("is_storyboard"))
+        metadata["manual_replacement_mode"] = "storyboard_jpeg" if is_storyboard else "original_suffix"
         _record_async_task(
             "manual_upscale_processing",
             task_id=local_job_id,
@@ -2010,7 +2051,10 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
                 delivery_slot = False
 
             staged_path = _compress_manual_replacement_output(
-                staged_path, source.suffix, params
+                staged_path,
+                source.suffix,
+                params,
+                output_format="jpeg" if is_storyboard else "original",
             )
             if _file_fingerprint(source) != original_fingerprint:
                 raise Exception("原图在超分期间已变化，已取消替换以避免覆盖新图片")
@@ -2018,16 +2062,19 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / f"{source.stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}{source.suffix}"
             shutil.copy2(source, backup_path)
-            os.replace(staged_path, source)
+            replacement_path = source.with_suffix(".jpg") if is_storyboard else source
+            os.replace(staged_path, replacement_path)
 
         host_refresh = _refresh_host_image_after_manual_upscale(
-            source, metadata.get("unique_name")
+            replacement_path,
+            metadata.get("unique_name"),
+            expected_source=source,
         )
         _record_async_task(
             "manual_upscale_replaced",
             task_id=gateway_task_id,
             status="success",
-            output_path=str(source.resolve()),
+            output_path=str(replacement_path.resolve()),
             output_url=output_url,
             output_type=output.get("type", ""),
             backup_path=str(backup_path.resolve()),
@@ -2037,11 +2084,11 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
             host_refresh_image_version=host_refresh.get("image_version"),
             **metadata,
         )
-        _persist_task_thumbnail(gateway_task_id, source)
+        _persist_task_thumbnail(gateway_task_id, replacement_path)
         if host_refresh.get("state") == "refreshed":
-            print(f"[Yali AI Image] 超分已替换并刷新分镜: {source}")
+            print(f"[Yali AI Image] 超分已替换并刷新分镜: {replacement_path}")
         else:
-            print(f"[Yali AI Image] 超分已替换，分镜未刷新: {source} ({host_refresh.get('reason', '')})")
+            print(f"[Yali AI Image] 超分已替换，分镜未刷新: {replacement_path} ({host_refresh.get('reason', '')})")
     except Exception as exc:
         _record_async_task(
             "manual_upscale_failed",
