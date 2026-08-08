@@ -92,6 +92,100 @@ _DEFAULT_UPSCALE_PROMPT = (
 )
 
 
+_TARGET_KIND_LABELS = {
+    "storyboard": "分镜",
+    "character": "角色",
+    "location": "场景",
+    "item": "物品",
+    "unknown": "通用/未识别",
+}
+
+
+def _normalize_target_kind(value):
+    """Normalize explicit host metadata without guessing from prompt text."""
+    key = str(value or "").strip().lower()
+    aliases = {
+        "panel": "storyboard",
+        "shot": "storyboard",
+        "scene": "location",
+        "prop": "item",
+        "object": "item",
+        "人物": "character",
+        "角色": "character",
+        "场景": "location",
+        "物品": "item",
+        "分镜": "storyboard",
+    }
+    key = aliases.get(key, key)
+    return key if key in _TARGET_KIND_LABELS else ""
+
+
+def _generation_target_metadata(context):
+    """Identify the host generation target using explicit fields or stable IDs.
+
+    The image-plugin contract does not currently require entity metadata. The
+    host's entity entry points do, however, use stable names such as
+    ``character_2``, ``location_1`` and ``item_1``. Those prefixes are used as
+    a narrow fallback; arbitrary prompt text and file paths are never used.
+    """
+    context = context if isinstance(context, dict) else {}
+    plugin_params = context.get("plugin_params") if isinstance(context.get("plugin_params"), dict) else {}
+    target = context.get("target") if isinstance(context.get("target"), dict) else {}
+
+    explicit_kind = (
+        context.get("target_kind")
+        or context.get("entity_type")
+        or context.get("generation_target_type")
+        or target.get("kind")
+        or target.get("type")
+        or plugin_params.get("target_kind")
+        or plugin_params.get("entity_type")
+    )
+    target_kind = _normalize_target_kind(explicit_kind)
+    # ``unknown`` is the persisted default, not a positive host signal. Let
+    # stable entity IDs still backfill old task rows in that case.
+    if target_kind == "unknown":
+        target_kind = ""
+
+    unique_name = str(context.get("unique_name", "") or "").strip()
+    target_id = str(
+        context.get("target_id")
+        or context.get("entity_id")
+        or target.get("id")
+        or target.get("entity_id")
+        or plugin_params.get("target_id")
+        or plugin_params.get("entity_id")
+        or ""
+    ).strip()
+    target_name = str(
+        context.get("target_name")
+        or context.get("entity_name")
+        or target.get("name")
+        or plugin_params.get("target_name")
+        or plugin_params.get("entity_name")
+        or ""
+    ).strip()
+
+    match = re.match(r"^(character|location|item)[_-](.+)$", unique_name, re.IGNORECASE)
+    if not target_kind and match:
+        target_kind = match.group(1).lower()
+    if not target_id and match:
+        target_id = match.group(2).strip()
+
+    # Current storyboard calls use a positive viewer index, while entity
+    # entry points use viewer_index=0. An absent/zero value remains unknown.
+    if not target_kind and unique_name and _safe_int(context.get("viewer_index", 0), 0) > 0:
+        target_kind = "storyboard"
+    if not target_kind:
+        target_kind = "unknown"
+
+    return {
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "target_name": target_name,
+    }
+
+
 def _load_config():
     with _config_lock:
         if not _CONFIG_PATH.exists():
@@ -1407,6 +1501,9 @@ def _summarize_async_task_events(events):
             "source_task_id": "",
             "viewer_index": 0,
             "unique_name": "",
+            "target_kind": "unknown",
+            "target_id": "",
+            "target_name": "",
             "generation_round": 0,
             "output_position": 0,
             "batch_index": 0,
@@ -1436,6 +1533,7 @@ def _summarize_async_task_events(events):
             "model", "quality", "image_size", "aspect_ratio", "request_size", "protocol", "generation_mode", "pipeline_stage",
             "upscale_target_image_size", "upscale_applied",
             "source_model", "source_task_id", "viewer_index", "unique_name",
+            "target_kind", "target_id", "target_name",
             "generation_round", "output_position", "batch_index", "batch_num", "reference_image_count",
             "shared_reference_prepare_ms", "stage_reference_prepare_ms", "submit_elapsed_ms", "prompt_preview",
             "backup_path", "host_refresh_state", "host_refresh_reason", "host_refresh_image_index",
@@ -1452,6 +1550,17 @@ def _summarize_async_task_events(events):
                 summary["output_urls"].append(url)
         if event.get("output_url") and event["output_url"] not in summary["output_urls"]:
             summary["output_urls"].append(event["output_url"])
+    # Backfill classification for logs created before target metadata existed.
+    # This makes existing character/location/item rows useful immediately
+    # without rewriting the user's task log file.
+    for summary in grouped.values():
+        inferred = _generation_target_metadata(summary)
+        if not summary.get("target_kind") or summary.get("target_kind") == "unknown":
+            summary["target_kind"] = inferred["target_kind"]
+        if not summary.get("target_id") and inferred["target_id"]:
+            summary["target_id"] = inferred["target_id"]
+        if not summary.get("target_name") and inferred["target_name"]:
+            summary["target_name"] = inferred["target_name"]
     return sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
 
 
@@ -1931,6 +2040,9 @@ def _manual_upscale_metadata(summary, params, source_task_id, source_path):
         "source_task_id": source_task_id,
         "viewer_index": _safe_int(summary.get("viewer_index", 0), 0),
         "unique_name": str(summary.get("unique_name", "") or ""),
+        "target_kind": str(summary.get("target_kind", "unknown") or "unknown"),
+        "target_id": str(summary.get("target_id", "") or ""),
+        "target_name": str(summary.get("target_name", "") or ""),
         "generation_round": _safe_int(summary.get("generation_round", 0), 0),
         "output_position": _safe_int(summary.get("output_position", 0), 0),
         "batch_index": 0,
@@ -3470,6 +3582,7 @@ def generate(context):
     output_positions = context.get("output_position")
     if not isinstance(output_positions, (list, tuple)):
         output_positions = []
+    target_metadata = _generation_target_metadata(context)
 
     configured_references = _configured_reference_paths()
     reference_images = _merge_reference_images(reference_images, configured_references)
@@ -3568,6 +3681,7 @@ def generate(context):
             "workflow_max_wait": workflow_max_wait,
             "viewer_index": _safe_int(context.get("viewer_index", 0), 0),
             "unique_name": str(context.get("unique_name", "") or ""),
+            **target_metadata,
             "generation_round": _safe_int(context.get("generation_round", 0), 0),
             "output_position": position,
             "batch_index": index,

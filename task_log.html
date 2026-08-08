@@ -19,6 +19,7 @@
     .select-col { width: 30px; text-align: center; }
     .task-id { width: 132px; max-width: 132px; font-family: monospace; white-space: normal; overflow-wrap: anywhere; word-break: break-all; }
     .storyboard { width: 132px; min-width: 132px; max-width: 148px; color: var(--text-muted); white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+    .target-kind { color: var(--text-primary); font-weight: 600; }
     .model { width: 175px; min-width: 175px; max-width: 190px; white-space: normal; overflow-wrap: anywhere; }
     .time { white-space: nowrap; }
     .status { white-space: nowrap; }
@@ -72,7 +73,7 @@
         <tr>
           <th class="select-col"><input id="selectAll" type="checkbox" title="选择当前页可超分任务"></th>
           <th>任务 ID</th>
-          <th>分镜关联</th>
+          <th>生成目标</th>
           <th>模型与参数</th>
           <th>状态</th>
           <th>更新时间</th>
@@ -163,6 +164,18 @@
       if (Number.isFinite(outputPosition) && outputPosition >= 0) parts.push('图位 ' + (outputPosition + 1))
       return parts.map(esc).join('<br>')
     }
+    function targetReference(task) {
+      var labels = { storyboard: '分镜', character: '角色', location: '场景', item: '物品', unknown: '通用/未识别' }
+      var kind = String(task.target_kind || 'unknown').toLowerCase()
+      var label = labels[kind] || labels.unknown
+      var parts = ['<span class="target-kind">' + esc(label) + '</span>']
+      var name = String(task.target_name || '').trim()
+      var id = String(task.target_id || '').trim()
+      if (name) parts.push(esc(name))
+      if (id) parts.push('ID ' + esc(id))
+      if (kind === 'storyboard' || (!name && !id && task.unique_name)) parts.push(storyboardReference(task))
+      return parts.join('<br>')
+    }
     function loadLogs() {
       PopupComm.send('get_task_logs', {
         page: page,
@@ -237,7 +250,7 @@
         row.innerHTML =
           '<td class="select-col">' + checkbox + '</td>' +
           '<td class="task-id">' + (sourceTask ? (manualWorkflow ? '超分 ' : 'B ') : '') + esc(task.task_id) + (sourceTask ? '<br><span class="meta">' + (manualWorkflow ? '原图 ' : 'A ') + esc(sourceTask.task_id) + '</span>' : '') + '</td>' +
-          '<td class="storyboard">' + storyboardReference(task) + '</td>' +
+          '<td class="storyboard">' + targetReference(task) + '</td>' +
           '<td class="model">' + settings + '</td>' +
           '<td class="status">' + esc(manualWorkflow ? manualUpscaleStatusText(task) : (task.status || task.event || '-')) + '<br>事件 ' + esc(task.event_count || 0) + '</td>' +
           '<td class="time">' + esc(formatTime(task.updated_at)) + '</td>' +

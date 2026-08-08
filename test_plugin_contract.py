@@ -793,6 +793,47 @@ class PluginContractTests(unittest.TestCase):
             self.assertTrue(cleared["ok"])
             self.assertEqual(plugin.handle_action("get_task_logs")["total"], 0)
 
+    def test_generation_target_metadata_marks_entity_entry_points(self):
+        self.assertEqual(
+            plugin._generation_target_metadata({"unique_name": "character_2", "viewer_index": 0}),
+            {"target_kind": "character", "target_id": "2", "target_name": ""},
+        )
+        self.assertEqual(
+            plugin._generation_target_metadata({"unique_name": "location_1", "viewer_index": 0}),
+            {"target_kind": "location", "target_id": "1", "target_name": ""},
+        )
+        self.assertEqual(
+            plugin._generation_target_metadata({"unique_name": "item_1", "viewer_index": 0}),
+            {"target_kind": "item", "target_id": "1", "target_name": ""},
+        )
+        self.assertEqual(
+            plugin._generation_target_metadata({
+                "entity_type": "location",
+                "entity_id": "7",
+                "entity_name": "城堡",
+                "unique_name": "arbitrary-host-id",
+            }),
+            {"target_kind": "location", "target_id": "7", "target_name": "城堡"},
+        )
+        self.assertEqual(
+            plugin._generation_target_metadata({"unique_name": "shot-a", "viewer_index": 3})["target_kind"],
+            "storyboard",
+        )
+        self.assertEqual(
+            plugin._generation_target_metadata({"unique_name": "standalone"})["target_kind"],
+            "unknown",
+        )
+        old_log_summary = plugin._summarize_async_task_events([
+            {"timestamp": 1, "event": "delivered", "task_id": "old-character", "status": "success",
+             "unique_name": "character_9", "viewer_index": 0},
+        ])[0]
+        self.assertEqual(old_log_summary["target_kind"], "character")
+        self.assertEqual(old_log_summary["target_id"], "9")
+
+        task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
+        self.assertIn("target_kind", task_log_html)
+        self.assertIn("targetReference", task_log_html)
+
     def test_ui_uses_settings_panel_and_mode_buttons(self):
         ui_html = (PLUGIN_PATH.parent / "ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn('<label class="form-label">API URL</label>', ui_html)
