@@ -96,7 +96,14 @@
     var PopupComm = {
       _handlers: {},
       send: function (action, data) {
-        if (window.opener) window.opener.postMessage({ __typetale_plugin: true, type: 'plugin_action', action: action, data: data || {} }, '*')
+        var message = { __typetale_plugin: true, type: 'plugin_action', action: action, data: data || {} }
+        var targets = []
+        if (window.opener && !window.opener.closed) targets.push(window.opener)
+        if (window.parent && window.parent !== window && targets.indexOf(window.parent) < 0) targets.push(window.parent)
+        targets.forEach(function (target) {
+          try { target.postMessage(message, '*') } catch (error) {}
+        })
+        return targets.length > 0
       },
       onAction: function (action, callback) {
         if (!this._handlers[action]) this._handlers[action] = []
@@ -120,6 +127,9 @@
     var selectAll = document.getElementById('selectAll')
     var batchUpscaleBtn = document.getElementById('batchUpscaleBtn')
     var activeManualPollTimer = null
+    var logLoadRetryTimer = null
+    var logLoadAttempts = 0
+    var logLoaded = false
 
     function setActionStatus(message, isError) {
       actionStatus.textContent = String(message || '')
@@ -177,12 +187,21 @@
       return parts.join('<br>')
     }
     function loadLogs() {
-      PopupComm.send('get_task_logs', {
+      logLoaded = false
+      logLoadAttempts += 1
+      var sent = PopupComm.send('get_task_logs', {
         page: page,
         page_size: pageSize,
         status: statusFilter.value,
         task_id: taskIdInput.value.trim()
       })
+      if (!sent) setActionStatus('等待宿主连接，正在重试读取任务日志...', false)
+      if (!logLoaded && logLoadAttempts < 10 && !logLoadRetryTimer) {
+        logLoadRetryTimer = setTimeout(function () {
+          logLoadRetryTimer = null
+          loadLogs()
+        }, 800)
+      }
     }
     function isActiveManualUpscale(task) {
       if (!task || task.generation_mode !== 'manual_upscale') return false
@@ -260,7 +279,14 @@
       })
     }
 
-    PopupComm.onAction('get_task_logs', function (data) { if (data && data.ok) renderLogs(data) })
+    PopupComm.onAction('get_task_logs', function (data) {
+      if (data && data.ok) {
+        logLoaded = true
+        logLoadAttempts = 0
+        if (logLoadRetryTimer) { clearTimeout(logLoadRetryTimer); logLoadRetryTimer = null }
+        renderLogs(data)
+      }
+    })
     PopupComm.onAction('clear_task_logs', function (data) {
       if (data && data.ok) { page = 1; loadLogs() }
     })
@@ -343,8 +369,10 @@
     })
     window.addEventListener('beforeunload', function () {
       if (activeManualPollTimer) clearInterval(activeManualPollTimer)
+      if (logLoadRetryTimer) clearTimeout(logLoadRetryTimer)
     })
     loadLogs()
+    window.addEventListener('focus', function () { setTimeout(loadLogs, 150) })
   </script>
 </body>
 </html>

@@ -793,6 +793,16 @@ class PluginContractTests(unittest.TestCase):
             self.assertTrue(cleared["ok"])
             self.assertEqual(plugin.handle_action("get_task_logs")["total"], 0)
 
+    def test_task_log_popup_retries_when_host_bridge_is_not_ready(self):
+        task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
+        self.assertIn("window.parent && window.parent !== window", task_log_html)
+        self.assertIn("window.opener && !window.opener.closed", task_log_html)
+        self.assertIn("return targets.length > 0", task_log_html)
+        self.assertIn("logLoadAttempts < 10", task_log_html)
+        self.assertIn("}, 800)", task_log_html)
+        self.assertIn("window.addEventListener('focus'", task_log_html)
+        self.assertIn("clearTimeout(logLoadRetryTimer)", task_log_html)
+
     def test_generation_target_metadata_marks_entity_entry_points(self):
         self.assertEqual(
             plugin._generation_target_metadata({"unique_name": "character_2", "viewer_index": 0}),
