@@ -7,6 +7,7 @@
   <style>
     body { padding: 16px 20px; }
     h3 { margin: 0 0 12px; }
+    .important-notice { margin: 0 0 14px; padding: 11px 14px; border: 1px solid #d97706; border-left: 5px solid #f59e0b; background: #3a2a12; color: #ffedd5; font-size: 13px; line-height: 1.55; font-weight: 600; }
     .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
     .toolbar input { min-width: 220px; }
     .toolbar select { width: auto; min-width: 120px; }
@@ -46,6 +47,7 @@
 </head>
 <body>
   <h3>鸭梨AI图像生成插件(低价版) - 任务日志</h3>
+  <div class="important-notice">重要提醒：角色、场景、物品在任务日志中超分后，可在此查看结果、打开图片 URL 或复制本地路径；宿主主界面需重启软件后才会显示超分结果。建议生成这三类图片时直接在插件中选择“超分”模式，避免后期超分无法即时同步。</div>
   <div class="toolbar">
     <select id="statusFilter">
       <option value="">全部状态</option>
