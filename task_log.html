@@ -263,7 +263,8 @@
           : ''
         var stateLabel = task.upscale_state === 'already_upscaled' ? '<span class="upscaled-badge">已超分</span>' : (task.upscale_state === 'superseded' ? '<span class="upscaled-badge">已被后续结果替换</span>' : '')
         var processingHint = isManualPending ? '<span class="in-progress">超分处理中，完成后自动替换原图</span>' : ''
-        var result = (sourceTask ? '<div class="image-pair">' + sourceImage + image + '</div>' : image) + localCopyLink + sourceCopyLink + sourceLinks + links + processingHint + action + unavailableHint + stateLabel + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
+        var hostRefresh = task.host_refresh_state === 'replaced' ? '<span class="host-refresh-warn">实体主图与缩略图已替换；重新加载宿主界面后生效</span>' : ''
+        var result = (sourceTask ? '<div class="image-pair">' + sourceImage + image + '</div>' : image) + localCopyLink + sourceCopyLink + sourceLinks + links + processingHint + action + unavailableHint + stateLabel + hostRefresh + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
         var stage = task.pipeline_stage === 'source' ? 'A 中间' : (task.pipeline_stage === 'upscale' ? 'B 最终' : (task.pipeline_stage === 'manual_upscale' ? '手动超分' : '单阶段'))
         var settings = esc(stage) + '<br>' + esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
         if (sourceTask) settings = (manualWorkflow ? '原图<br>' : 'A 基础<br>') + esc(sourceTask.model || '-') + '<br>' + esc(sourceTask.request_size || sourceTask.image_size || '-') + ' / ' + esc(sourceTask.aspect_ratio || '-') + '<hr>' + (manualWorkflow ? '手动超分<br>' : 'B 超分<br>') + settings

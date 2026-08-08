@@ -1523,6 +1523,9 @@ def _summarize_async_task_events(events):
             "local_image_format": "",
             "local_image_size_bytes": 0,
             "manual_replacement_mode": "",
+            "thumbnail_backup_path": "",
+            "entity_image_path": "",
+            "entity_thumbnail_path": "",
         })
         summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
         summary["updated_at"] = max(summary["updated_at"], timestamp)
@@ -1539,7 +1542,7 @@ def _summarize_async_task_events(events):
             "backup_path", "host_refresh_state", "host_refresh_reason", "host_refresh_image_index",
             "host_refresh_image_version", "host_frame", "host_frame_path",
             "local_image_format", "local_image_size_bytes",
-            "manual_replacement_mode",
+            "manual_replacement_mode", "thumbnail_backup_path", "entity_image_path", "entity_thumbnail_path",
         ):
             if event.get(key) not in (None, ""):
                 summary[key] = event[key]
@@ -1593,11 +1596,9 @@ def _query_async_task_logs(page, page_size, status="", task_id=""):
         target_kind = _normalize_target_kind(item.get("target_kind")) or "unknown"
         item["can_manual_upscale"] = (
             state == "eligible"
-            and target_kind == "storyboard"
+            and target_kind in {"storyboard", "character", "location", "item"}
             and bool(item.get("local_image_exists"))
         )
-        if state == "eligible" and target_kind in {"character", "location", "item"}:
-            item["manual_upscale_unavailable_reason"] = "任务日志仅支持分镜图片超分"
     return {
         "tasks": page_tasks,
         "page": page,
@@ -1784,7 +1785,7 @@ def _build_manual_upscale_states(tasks):
     for summary in tasks:
         if str(summary.get("status", "")).lower() != "success":
             continue
-        path_key = _canonical_output_path(summary.get("output_path"))
+        path_key = _manual_asset_key(summary)
         if not path_key:
             continue
         current = newest_by_path.get(path_key)
@@ -1798,7 +1799,7 @@ def _build_manual_upscale_states(tasks):
         if str(summary.get("status", "")).lower() != "success":
             states[task_id] = "unavailable"
             continue
-        path_key = _canonical_output_path(summary.get("output_path"))
+        path_key = _manual_asset_key(summary)
         latest = newest_by_path.get(path_key)
         if not path_key or latest is None:
             states[task_id] = "unavailable"
@@ -1921,6 +1922,119 @@ def _call_host_tool(name, arguments):
     if payload.get("success") is False or payload.get("ok") is False:
         raise RuntimeError(str(payload.get("error") or "宿主工具执行失败"))
     return payload
+
+
+def _entity_asset_from_host(summary):
+    """Resolve the host-owned primary image and thumbnail for one entity."""
+    target_kind = _normalize_target_kind(summary.get("target_kind"))
+    if target_kind not in {"character", "location", "item"}:
+        return None
+    target_id = str(summary.get("target_id", "") or "").strip()
+    target_name = str(summary.get("target_name", "") or "").strip()
+    if not target_id and not target_name:
+        raise RuntimeError("实体任务缺少实体 ID 或名称")
+
+    payload = _call_host_tool("zzdh_get_entity_list", {"entity_type": target_kind})
+    entities = payload.get("entities") if isinstance(payload, dict) else None
+    if not isinstance(entities, list):
+        raise RuntimeError("宿主实体列表返回格式无效")
+    id_field = f"{target_kind}_id"
+    entity = None
+    for candidate in entities:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get(id_field, "") or "").strip()
+        candidate_name = str(candidate.get("name", "") or "").strip()
+        if (target_id and candidate_id == target_id) or (not target_id and target_name and candidate_name == target_name):
+            entity = candidate
+            break
+    if entity is None:
+        raise RuntimeError(f"宿主未找到{_TARGET_KIND_LABELS[target_kind]}实体")
+
+    image_path = str(entity.get("image_path", "") or "").strip()
+    thumbnail_path = str(entity.get("thumbnail_path", "") or "").strip()
+    if not image_path:
+        references = entity.get("reference_items") if isinstance(entity.get("reference_items"), list) else []
+        for reference in references:
+            if not isinstance(reference, dict) or str(reference.get("media_type", "image")) != "image":
+                continue
+            image_path = str(reference.get("path", "") or "").strip()
+            if image_path:
+                break
+    if not image_path:
+        raise RuntimeError("宿主实体没有可替换的主图片")
+
+    source = Path(image_path).resolve()
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise RuntimeError("宿主实体主图片文件不存在")
+    thumbnail = Path(thumbnail_path).resolve() if thumbnail_path else None
+    return {
+        "target_kind": target_kind,
+        "target_id": str(entity.get(id_field, target_id) or target_id),
+        "image_path": str(source),
+        "thumbnail_path": str(thumbnail) if thumbnail else "",
+    }
+
+
+def _manual_asset_key(summary):
+    target_kind = _normalize_target_kind(summary.get("target_kind"))
+    target_id = str(summary.get("target_id", "") or "").strip()
+    if target_kind in {"character", "location", "item"} and target_id:
+        return f"entity:{target_kind}:{target_id}"
+    return _canonical_output_path(summary.get("output_path"))
+
+
+def _encode_entity_thumbnail(source):
+    with Image.open(source) as opened:
+        opened.load()
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+        image.thumbnail((500, 500), getattr(Image, "Resampling", Image).LANCZOS)
+        buffer = BytesIO()
+        image.save(buffer, "JPEG", quality=85, optimize=True, progressive=True)
+        image.close()
+        return buffer.getvalue()
+
+
+def _replace_entity_asset(staged_path, asset, original_fingerprint):
+    """Atomically replace an entity's main image and host-generated thumbnail."""
+    source = Path(asset["image_path"]).resolve()
+    thumbnail = Path(str(asset.get("thumbnail_path", "") or "")).resolve() if asset.get("thumbnail_path") else None
+    if _file_fingerprint(source) != original_fingerprint:
+        raise RuntimeError("实体原图在超分期间已变化，已取消替换")
+    with Image.open(staged_path) as image:
+        image.verify()
+    thumbnail_bytes = _encode_entity_thumbnail(staged_path) if thumbnail else b""
+    backup_dir = source.parent / ".yaliai-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    main_backup = backup_dir / f"{source.stem}_{stamp}{source.suffix}"
+    thumbnail_backup = None
+    thumbnail_temp = None
+    shutil.copy2(source, main_backup)
+    if thumbnail and thumbnail.is_file():
+        thumbnail_backup = backup_dir / f"{thumbnail.stem}_{stamp}{thumbnail.suffix}"
+        shutil.copy2(thumbnail, thumbnail_backup)
+    try:
+        if thumbnail:
+            thumbnail.parent.mkdir(parents=True, exist_ok=True)
+            thumbnail_temp = thumbnail.with_name(f".{thumbnail.stem}.yaliai-{uuid.uuid4().hex}.tmp")
+            thumbnail_temp.write_bytes(thumbnail_bytes)
+        os.replace(staged_path, source)
+        if thumbnail_temp:
+            os.replace(thumbnail_temp, thumbnail)
+    except Exception:
+        if thumbnail_temp and thumbnail_temp.exists():
+            thumbnail_temp.unlink(missing_ok=True)
+        shutil.copy2(main_backup, source)
+        if thumbnail_backup and thumbnail_backup.is_file():
+            shutil.copy2(thumbnail_backup, thumbnail)
+        raise
+    return {
+        "image_path": str(source),
+        "thumbnail_path": str(thumbnail) if thumbnail else "",
+        "backup_path": str(main_backup),
+        "thumbnail_backup_path": str(thumbnail_backup) if thumbnail_backup else "",
+    }
 
 
 def _probe_host_storyboard_source(source, unique_name):
@@ -2073,15 +2187,20 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
     delivery_slot = False
     try:
         source = Path(source_path)
+        target_kind = _normalize_target_kind(summary.get("target_kind")) or "unknown"
+        entity_asset = summary.get("_entity_asset") if isinstance(summary.get("_entity_asset"), dict) else None
         original_fingerprint = _file_fingerprint(source)
         params = _merge_runtime_params({})
         endpoint = _normalize_endpoint(params.get("endpoint", _GATEWAY_ENDPOINT))
         metadata = _manual_upscale_metadata(summary, params, source_task_id, source)
-        storyboard_probe = _probe_host_storyboard_source(
-            source, metadata.get("unique_name")
+        storyboard_probe = (
+            _probe_host_storyboard_source(source, metadata.get("unique_name"))
+            if target_kind == "storyboard" else {"is_storyboard": False}
         )
         is_storyboard = bool(storyboard_probe.get("is_storyboard"))
-        metadata["manual_replacement_mode"] = "storyboard_jpeg" if is_storyboard else "original_suffix"
+        metadata["manual_replacement_mode"] = (
+            "storyboard_jpeg" if is_storyboard else ("entity_asset" if entity_asset else "original_suffix")
+        )
         _record_async_task(
             "manual_upscale_processing",
             task_id=local_job_id,
@@ -2175,19 +2294,32 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
                 params,
                 output_format="jpeg" if is_storyboard else "original",
             )
-            if _file_fingerprint(source) != original_fingerprint:
-                raise Exception("原图在超分期间已变化，已取消替换以避免覆盖新图片")
-            backup_dir = source.parent / ".yaliai-backups"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_dir / f"{source.stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}{source.suffix}"
-            shutil.copy2(source, backup_path)
-            replacement_path = source.with_suffix(".jpg") if is_storyboard else source
-            os.replace(staged_path, replacement_path)
+            if entity_asset:
+                replacement = _replace_entity_asset(staged_path, entity_asset, original_fingerprint)
+                replacement_path = Path(replacement["image_path"])
+                backup_path = Path(replacement["backup_path"])
+                thumbnail_backup_path = replacement["thumbnail_backup_path"]
+            else:
+                if _file_fingerprint(source) != original_fingerprint:
+                    raise Exception("原图在超分期间已变化，已取消替换以避免覆盖新图片")
+                backup_dir = source.parent / ".yaliai-backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backup_dir / f"{source.stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}{source.suffix}"
+                shutil.copy2(source, backup_path)
+                thumbnail_backup_path = ""
+                replacement_path = source.with_suffix(".jpg") if is_storyboard else source
+                os.replace(staged_path, replacement_path)
 
-        host_refresh = _refresh_host_image_after_manual_upscale(
-            replacement_path,
-            metadata.get("unique_name"),
-            expected_source=source,
+        host_refresh = (
+            {
+                "state": "replaced",
+                "reason": "实体主图与缩略图已替换；宿主界面重新加载后生效",
+            }
+            if entity_asset else _refresh_host_image_after_manual_upscale(
+                replacement_path,
+                metadata.get("unique_name"),
+                expected_source=source,
+            )
         )
         _record_async_task(
             "manual_upscale_replaced",
@@ -2197,6 +2329,9 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
             output_url=output_url,
             output_type=output.get("type", ""),
             backup_path=str(backup_path.resolve()),
+            thumbnail_backup_path=thumbnail_backup_path,
+            entity_image_path=(replacement.get("image_path", "") if entity_asset else ""),
+            entity_thumbnail_path=(replacement.get("thumbnail_path", "") if entity_asset else ""),
             host_refresh_state=host_refresh.get("state", ""),
             host_refresh_reason=host_refresh.get("reason", ""),
             host_refresh_image_index=host_refresh.get("image_index"),
@@ -2206,6 +2341,8 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
         _persist_task_thumbnail(gateway_task_id, replacement_path)
         if host_refresh.get("state") == "refreshed":
             print(f"[Yali AI Image] 超分已替换并刷新分镜: {replacement_path}")
+        elif host_refresh.get("state") == "replaced":
+            print(f"[Yali AI Image] 超分已替换实体主图与缩略图: {replacement_path}")
         else:
             print(f"[Yali AI Image] 超分已替换，分镜未刷新: {replacement_path} ({host_refresh.get('reason', '')})")
     except Exception as exc:
@@ -2239,8 +2376,15 @@ def _start_manual_upscale(task_id):
     if not summary:
         return {"ok": False, "error": "未找到任务记录"}
     target_kind = _normalize_target_kind(summary.get("target_kind")) or "unknown"
-    if target_kind != "storyboard":
-        return {"ok": False, "error": "任务日志仅支持分镜图片超分"}
+    entity_asset = None
+    if target_kind in {"character", "location", "item"}:
+        try:
+            entity_asset = _entity_asset_from_host(summary)
+        except Exception as exc:
+            return {"ok": False, "error": f"无法定位宿主实体原图: {exc}"}
+        source = Path(entity_asset["image_path"])
+    else:
+        source = Path(str(summary.get("output_path", "") or ""))
     upscale_state = _build_manual_upscale_states(_summarize_async_task_events(_read_async_task_events())).get(
         str(summary.get("task_id", "")), "unavailable"
     )
@@ -2250,9 +2394,8 @@ def _start_manual_upscale(task_id):
         return {"ok": False, "error": "该任务图片已被后续结果替换，请选择最新任务"}
     if upscale_state != "eligible":
         return {"ok": False, "error": "仅当前未超分的成功图片可以超分"}
-    source = Path(str(summary.get("output_path", "") or ""))
     if not source.is_file() or source.stat().st_size <= 0:
-        return {"ok": False, "error": "原图文件不存在，无法替换对应分镜"}
+        return {"ok": False, "error": "宿主实体原图文件不存在，无法替换" if entity_asset else "原图文件不存在，无法替换对应分镜"}
     try:
         with Image.open(source) as image:
             image.verify()
@@ -2269,6 +2412,9 @@ def _start_manual_upscale(task_id):
         pending_metadata = _manual_upscale_metadata(
             summary, pending_params, str(summary["task_id"]), source
         )
+        if entity_asset:
+            pending_metadata["entity_image_path"] = entity_asset["image_path"]
+            pending_metadata["entity_thumbnail_path"] = entity_asset.get("thumbnail_path", "")
         _record_async_task(
             "manual_upscale_queued",
             task_id=local_job_id,
@@ -2281,7 +2427,10 @@ def _start_manual_upscale(task_id):
         raise
     worker = threading.Thread(
         target=_run_manual_upscale,
-        args=(dict(summary), str(source.resolve()), source_key, local_job_id),
+        args=(
+            {**dict(summary), "_entity_asset": entity_asset} if entity_asset else dict(summary),
+            str(source.resolve()), source_key, local_job_id,
+        ),
         name=f"yaliai-manual-upscale-{uuid.uuid4().hex[:8]}",
         daemon=True,
     )
@@ -2290,7 +2439,10 @@ def _start_manual_upscale(task_id):
         "ok": True,
         "task_id": local_job_id,
         "source_task_id": str(summary["task_id"]),
-        "message": "超分任务已进入队列；完成后会备份并替换当前分镜图片",
+        "message": (
+            "超分任务已进入队列；完成后会备份并替换宿主实体主图与缩略图"
+            if entity_asset else "超分任务已进入队列；完成后会备份并替换当前分镜图片"
+        ),
     }
 
 

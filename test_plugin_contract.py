@@ -793,24 +793,68 @@ class PluginContractTests(unittest.TestCase):
             self.assertTrue(cleared["ok"])
             self.assertEqual(plugin.handle_action("get_task_logs")["total"], 0)
 
-    def test_task_log_manual_upscale_rejects_entity_images(self):
+    def test_entity_manual_upscale_resolves_and_replaces_primary_and_thumbnail(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"
         ):
-            image_path = Path(temp_dir) / "character.png"
+            image_path = Path(temp_dir) / "character_images" / "character_3.png"
+            thumbnail_path = Path(temp_dir) / "thumbnails_500" / "character_3.jpg"
+            image_path.parent.mkdir()
+            thumbnail_path.parent.mkdir()
             Image.new("RGB", (8, 8), "white").save(image_path)
+            Image.new("RGB", (4, 4), "white").save(thumbnail_path, "JPEG")
             plugin._record_async_task(
                 "delivered", task_id="character-task", status="success",
                 target_kind="character", target_id="3", unique_name="character_3",
                 output_path=str(image_path),
             )
-            page = plugin.handle_action("get_task_logs", {"page": 1, "page_size": 10})
-            task = page["tasks"][0]
-            self.assertFalse(task["can_manual_upscale"])
-            self.assertEqual(task["manual_upscale_unavailable_reason"], "任务日志仅支持分镜图片超分")
-            rejected = plugin.handle_action("start_manual_upscale", {"task_id": "character-task"})
-            self.assertFalse(rejected["ok"])
-            self.assertEqual(rejected["error"], "任务日志仅支持分镜图片超分")
+            summary = plugin._find_task_log_summary("character-task")
+            host_entity = {
+                "entities": [{
+                    "character_id": "3",
+                    "image_path": str(image_path),
+                    "thumbnail_path": str(thumbnail_path),
+                    "reference_items": [{"path": str(image_path), "media_type": "image"}],
+                }],
+            }
+            with patch.object(plugin, "_call_host_tool", return_value=host_entity):
+                asset = plugin._entity_asset_from_host(summary)
+            self.assertEqual(asset["image_path"], str(image_path.resolve()))
+            self.assertEqual(asset["thumbnail_path"], str(thumbnail_path.resolve()))
+
+            staged = Path(temp_dir) / "staged.png"
+            Image.new("RGB", (16, 12), "red").save(staged)
+            original_hash = plugin._file_fingerprint(image_path)
+            replacement = plugin._replace_entity_asset(str(staged), asset, original_hash)
+            self.assertEqual(replacement["image_path"], str(image_path.resolve()))
+            self.assertEqual(replacement["thumbnail_path"], str(thumbnail_path.resolve()))
+            with Image.open(image_path) as image:
+                self.assertEqual(image.getpixel((0, 0)), (255, 0, 0))
+            with Image.open(thumbnail_path) as thumbnail:
+                self.assertEqual(thumbnail.format, "JPEG")
+            self.assertTrue(Path(replacement["backup_path"]).is_file())
+            self.assertTrue(Path(replacement["thumbnail_backup_path"]).is_file())
+
+    def test_entity_asset_resolution_uses_one_common_path_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for kind, entity_id, suffix in (("character", "3", ".png"), ("location", "2", ".jpg"), ("item", "1", ".webp")):
+                with self.subTest(kind=kind):
+                    image_path = Path(temp_dir) / f"{kind}_{entity_id}{suffix}"
+                    thumbnail_path = Path(temp_dir) / f"thumb_{kind}_{entity_id}.jpg"
+                    Image.new("RGB", (4, 4), "white").save(image_path)
+                    Image.new("RGB", (2, 2), "white").save(thumbnail_path, "JPEG")
+                    id_field = f"{kind}_id"
+                    summary = {"target_kind": kind, "target_id": entity_id, "target_name": ""}
+                    payload = {"entities": [{
+                        id_field: entity_id,
+                        "image_path": str(image_path),
+                        "thumbnail_path": str(thumbnail_path),
+                    }]}
+                    with patch.object(plugin, "_call_host_tool", return_value=payload) as host_call:
+                        asset = plugin._entity_asset_from_host(summary)
+                    self.assertEqual(asset["image_path"], str(image_path.resolve()))
+                    self.assertEqual(asset["thumbnail_path"], str(thumbnail_path.resolve()))
+                    host_call.assert_called_once_with("zzdh_get_entity_list", {"entity_type": kind})
 
     def test_task_log_popup_retries_when_host_bridge_is_not_ready(self):
         task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")

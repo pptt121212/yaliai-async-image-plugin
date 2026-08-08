@@ -272,6 +272,7 @@
         var processingHint = isManualPending ? '<span class="in-progress">超分处理中，完成后自动替换原图</span>' : ''
         var hostRefresh = ''
         if (manualWorkflow && task.host_refresh_state === 'refreshed') hostRefresh = '<span class="host-refresh">已刷新到当前分镜</span>'
+        else if (manualWorkflow && task.host_refresh_state === 'replaced') hostRefresh = '<span class="host-refresh-warn">实体主图与缩略图已替换；重新加载宿主界面后生效</span>'
         else if (manualWorkflow && task.host_refresh_state && task.host_refresh_state !== 'refreshed') hostRefresh = '<span class="host-refresh-warn">图片已替换；' + esc(task.host_refresh_reason || '宿主刷新未完成') + '</span>'
         var result = (sourceTask ? '<div class="image-pair">' + sourceImage + image + '</div>' : image) + localCopyLink + sourceCopyLink + sourceLinks + links + processingHint + action + unavailableHint + stateLabel + hostRefresh + frameActions + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
         var stage = task.pipeline_stage === 'source' ? 'A 中间' : (task.pipeline_stage === 'upscale' ? 'B 最终' : (task.pipeline_stage === 'manual_upscale' ? '手动超分' : '单阶段'))
