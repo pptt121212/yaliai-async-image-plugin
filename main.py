@@ -1590,7 +1590,14 @@ def _query_async_task_logs(page, page_size, status="", task_id=""):
         state = upscale_states.get(str(item.get("task_id", "")), "unavailable")
         item["upscale_state"] = state
         item["already_upscaled"] = state == "already_upscaled"
-        item["can_manual_upscale"] = state == "eligible" and bool(item.get("local_image_exists"))
+        target_kind = _normalize_target_kind(item.get("target_kind")) or "unknown"
+        item["can_manual_upscale"] = (
+            state == "eligible"
+            and target_kind == "storyboard"
+            and bool(item.get("local_image_exists"))
+        )
+        if state == "eligible" and target_kind in {"character", "location", "item"}:
+            item["manual_upscale_unavailable_reason"] = "任务日志仅支持分镜图片超分"
     return {
         "tasks": page_tasks,
         "page": page,
@@ -2231,6 +2238,9 @@ def _start_manual_upscale(task_id):
     summary = _find_task_log_summary(task_id)
     if not summary:
         return {"ok": False, "error": "未找到任务记录"}
+    target_kind = _normalize_target_kind(summary.get("target_kind")) or "unknown"
+    if target_kind != "storyboard":
+        return {"ok": False, "error": "任务日志仅支持分镜图片超分"}
     upscale_state = _build_manual_upscale_states(_summarize_async_task_events(_read_async_task_events())).get(
         str(summary.get("task_id", "")), "unavailable"
     )

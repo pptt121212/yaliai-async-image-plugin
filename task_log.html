@@ -35,6 +35,7 @@
     .upscale-btn { margin-top: 7px; width: 100%; font-size: 12px; }
     .local-copy-btn { margin-top: 5px; width: 100%; font-size: 12px; }
     .upscaled-badge { display: inline-block; margin-top: 7px; color: var(--text-muted); font-size: 12px; }
+    .upscale-unavailable { display: inline-block; margin-top: 7px; color: var(--text-muted); font-size: 12px; }
     .in-progress { display: inline-block; margin-top: 7px; color: var(--primary-color); font-size: 12px; }
     .batch-upscale-btn { white-space: nowrap; }
     .action-status { min-height: 17px; color: var(--text-muted); font-size: 11px; }
@@ -257,9 +258,12 @@
         var canUpscale = !!task.can_manual_upscale
         var checkbox = canUpscale ? '<input class="task-select" type="checkbox" data-task-select="' + esc(task.task_id) + '"' + (selectedTaskIds.has(String(task.task_id)) ? ' checked' : '') + '>' : ''
         var action = canUpscale ? '<button class="upscale-btn" type="button" data-upscale-task="' + esc(task.task_id) + '">超分并替换</button>' : ''
+        var unavailableHint = task.manual_upscale_unavailable_reason
+          ? '<span class="upscale-unavailable">' + esc(task.manual_upscale_unavailable_reason) + '</span>'
+          : ''
         var stateLabel = task.upscale_state === 'already_upscaled' ? '<span class="upscaled-badge">已超分</span>' : (task.upscale_state === 'superseded' ? '<span class="upscaled-badge">已被后续结果替换</span>' : '')
         var processingHint = isManualPending ? '<span class="in-progress">超分处理中，完成后自动替换原图</span>' : ''
-        var result = (sourceTask ? '<div class="image-pair">' + sourceImage + image + '</div>' : image) + localCopyLink + sourceCopyLink + sourceLinks + links + processingHint + action + stateLabel + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
+        var result = (sourceTask ? '<div class="image-pair">' + sourceImage + image + '</div>' : image) + localCopyLink + sourceCopyLink + sourceLinks + links + processingHint + action + unavailableHint + stateLabel + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
         var stage = task.pipeline_stage === 'source' ? 'A 中间' : (task.pipeline_stage === 'upscale' ? 'B 最终' : (task.pipeline_stage === 'manual_upscale' ? '手动超分' : '单阶段'))
         var settings = esc(stage) + '<br>' + esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
         if (sourceTask) settings = (manualWorkflow ? '原图<br>' : 'A 基础<br>') + esc(sourceTask.model || '-') + '<br>' + esc(sourceTask.request_size || sourceTask.image_size || '-') + ' / ' + esc(sourceTask.aspect_ratio || '-') + '<hr>' + (manualWorkflow ? '手动超分<br>' : 'B 超分<br>') + settings

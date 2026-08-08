@@ -793,6 +793,25 @@ class PluginContractTests(unittest.TestCase):
             self.assertTrue(cleared["ok"])
             self.assertEqual(plugin.handle_action("get_task_logs")["total"], 0)
 
+    def test_task_log_manual_upscale_rejects_entity_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            plugin, "_ASYNC_TASK_LOG_PATH", Path(temp_dir) / "async_tasks.jsonl"
+        ):
+            image_path = Path(temp_dir) / "character.png"
+            Image.new("RGB", (8, 8), "white").save(image_path)
+            plugin._record_async_task(
+                "delivered", task_id="character-task", status="success",
+                target_kind="character", target_id="3", unique_name="character_3",
+                output_path=str(image_path),
+            )
+            page = plugin.handle_action("get_task_logs", {"page": 1, "page_size": 10})
+            task = page["tasks"][0]
+            self.assertFalse(task["can_manual_upscale"])
+            self.assertEqual(task["manual_upscale_unavailable_reason"], "任务日志仅支持分镜图片超分")
+            rejected = plugin.handle_action("start_manual_upscale", {"task_id": "character-task"})
+            self.assertFalse(rejected["ok"])
+            self.assertEqual(rejected["error"], "任务日志仅支持分镜图片超分")
+
     def test_task_log_popup_retries_when_host_bridge_is_not_ready(self):
         task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
         self.assertIn("window.parent && window.parent !== window", task_log_html)
