@@ -867,8 +867,13 @@ def _local_result_target_bytes(params):
     return int(megabytes * 1024 * 1024)
 
 
-def _compress_delivered_output(path, params, is_cancelled=lambda: False):
-    """Compress only final host-visible files; staging images stay lossless for the B stage."""
+def _compress_delivered_output(
+    path,
+    params,
+    is_cancelled=lambda: False,
+    allow_format_change=False,
+):
+    """Compress a fresh host result; existing replacements keep their format."""
     source = Path(path)
     target_bytes = _local_result_target_bytes(params)
     try:
@@ -882,7 +887,17 @@ def _compress_delivered_output(path, params, is_cancelled=lambda: False):
                     staging_dir,
                     target_bytes,
                     is_cancelled=is_cancelled,
+                    allow_format_change=allow_format_change,
                 )
+                if allow_format_change and source.suffix.lower() not in {".jpg", ".jpeg"}:
+                    replacement = source.with_suffix(".jpg")
+                    os.replace(compressed_path, replacement)
+                    source.unlink()
+                    print(
+                        f"[Yali AI Image] 新结果已转 JPEG 并交给宿主: {replacement.name} "
+                        f"({replacement.stat().st_size / 1024 / 1024:.2f} MB)"
+                    )
+                    return str(replacement)
                 if os.path.abspath(compressed_path) == os.path.abspath(str(source)):
                     return str(source)
                 # Keep the host-visible path stable. The host may already hold
@@ -924,16 +939,24 @@ def _encode_delivered_image(image, image_format, quality):
     return output.getvalue()
 
 
-def _compress_delivered_image_file(path, staging_dir, max_target_bytes, is_cancelled=lambda: False):
-    """Compress an output in place while retaining PNG/JPEG/WebP and its path."""
+def _compress_delivered_image_file(
+    path,
+    staging_dir,
+    max_target_bytes,
+    is_cancelled=lambda: False,
+    allow_format_change=False,
+):
+    """Compress a fresh output, optionally converting it to a real JPEG."""
     source = os.path.abspath(str(path))
     source_size = os.path.getsize(source)
     with Image.open(source) as opened:
-        image_format = str(opened.format or "").upper()
-        if image_format not in {"PNG", "JPEG", "JPG", "WEBP"}:
-            raise ValueError(f"不支持保留的图片格式: {image_format or 'unknown'}")
+        source_format = str(opened.format or "").upper()
+        if source_format not in {"PNG", "JPEG", "JPG", "WEBP"}:
+            raise ValueError(f"不支持压缩的图片格式: {source_format or 'unknown'}")
         image = ImageOps.exif_transpose(opened)
         image.load()
+
+    image_format = "JPEG" if allow_format_change else source_format
 
     width, height = image.size
     if width < 1 or height < 1:
@@ -942,7 +965,10 @@ def _compress_delivered_image_file(path, staging_dir, max_target_bytes, is_cance
 
     target_bytes = _reference_target_bytes_for_pixels(max_target_bytes, width * height)
     current_width, current_height = width, height
-    needs_resize = (
+    # A fresh result has not been registered by the host yet, so returning a
+    # new JPEG path is safe. Keep full dimensions unless JPEG quality alone
+    # cannot satisfy the configured size limit.
+    needs_resize = not allow_format_change and (
         max(width, height) > _REFERENCE_IMAGE_MAX_LONG_EDGE
         or width * height > _REFERENCE_IMAGE_SOFT_PIXELS
     )
@@ -992,7 +1018,8 @@ def _compress_delivered_image_file(path, staging_dir, max_target_bytes, is_cance
 
     if not best or len(best) > target_bytes:
         raise ValueError(f"本地结果压缩失败: {os.path.basename(source)}")
-    output_path = os.path.join(staging_dir, os.path.basename(source))
+    output_name = f"{Path(source).stem}.jpg" if allow_format_change else os.path.basename(source)
+    output_path = os.path.join(staging_dir, output_name)
     with open(output_path, "wb") as output:
         output.write(best)
     return output_path
@@ -1388,6 +1415,8 @@ def _summarize_async_task_events(events):
             "host_refresh_image_version": None,
             "host_frame": "",
             "host_frame_path": "",
+            "local_image_format": "",
+            "local_image_size_bytes": 0,
         })
         summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
         summary["updated_at"] = max(summary["updated_at"], timestamp)
@@ -1402,6 +1431,7 @@ def _summarize_async_task_events(events):
             "shared_reference_prepare_ms", "stage_reference_prepare_ms", "submit_elapsed_ms", "prompt_preview",
             "backup_path", "host_refresh_state", "host_refresh_reason", "host_refresh_image_index",
             "host_refresh_image_version", "host_frame", "host_frame_path",
+            "local_image_format", "local_image_size_bytes",
         ):
             if event.get(key) not in (None, ""):
                 summary[key] = event[key]
@@ -3601,8 +3631,18 @@ def generate(context):
                 if delivery_slot:
                     _local_delivery_gate.release()
             if compress_result:
-                path = _compress_delivered_output(path, params, is_cancelled=is_cancelled)
+                path = _compress_delivered_output(
+                    path,
+                    params,
+                    is_cancelled=is_cancelled,
+                    allow_format_change=True,
+                )
             _persist_task_thumbnail(task_id, path)
+            try:
+                with Image.open(path) as delivered_image:
+                    local_image_format = str(delivered_image.format or "").lower()
+            except Exception:
+                local_image_format = ""
             _record_async_task(
                 event_name,
                 task_id=task_id,
@@ -3610,6 +3650,8 @@ def generate(context):
                 output_path=os.path.abspath(path),
                 output_url=image_url,
                 output_type=output.get("type", ""),
+                local_image_format=local_image_format,
+                local_image_size_bytes=os.path.getsize(path),
                 **stage_metadata,
             )
             return path, task_id

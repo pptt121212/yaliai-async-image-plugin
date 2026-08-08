@@ -176,7 +176,7 @@
         <label class="form-label">本地结果压缩上限</label>
         <div class="form-control"><input type="number" id="localResultMaxMbInput" min="1" max="50" step="0.5" inputmode="decimal" aria-describedby="localResultMaxMbHint"></div>
       </div>
-      <p class="field-hint" id="localResultMaxMbHint">图片下载完成后，超过该大小才会安全压缩为 JPG 并保留比例。默认 5 MB。</p>
+      <p class="field-hint" id="localResultMaxMbHint">新生成图片超限时转为 JPEG，保持比例；手动超分替换原图时保持原后缀。默认 5 MB。</p>
       <p class="field-hint">单张参考图不超过 2 MB 时原样上传；超过 2 MB 时安全压缩后上传，保持比例且不修改原文件。</p>
     </section>
   </div>

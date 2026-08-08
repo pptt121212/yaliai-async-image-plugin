@@ -427,6 +427,27 @@ class PluginContractTests(unittest.TestCase):
                 with Image.open(source_path) as image:
                     self.assertEqual(image.format, "JPEG" if extension == ".jpg" else "WEBP")
 
+    def test_fresh_delivered_png_can_become_jpeg_without_resizing(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            source_path = Path(source_dir) / "fresh.png"
+            with Image.new("RGB", (4800, 3584), (120, 80, 40)) as image:
+                image.save(source_path, "PNG")
+            source_path.write_bytes(source_path.read_bytes() + b"x" * (2 * 1024 * 1024))
+
+            result_path = plugin._compress_delivered_output(
+                source_path,
+                {"local_result_max_mb": 1},
+                allow_format_change=True,
+            )
+
+            result = Path(result_path)
+            self.assertEqual(result.suffix, ".jpg")
+            self.assertFalse(source_path.exists())
+            self.assertLessEqual(result.stat().st_size, 1 * 1024 * 1024)
+            with Image.open(result) as image:
+                self.assertEqual(image.format, "JPEG")
+                self.assertEqual(image.size, (4800, 3584))
+
     def test_large_reference_is_compressed_instead_of_rejected(self):
         with tempfile.TemporaryDirectory() as source_dir:
             source_path = Path(source_dir) / "large.png"
