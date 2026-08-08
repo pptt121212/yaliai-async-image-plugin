@@ -187,6 +187,48 @@ class PluginContractTests(unittest.TestCase):
             self.assertEqual(result["state"], "unavailable")
             self.assertIn("connection refused", result["reason"])
 
+    def test_delivered_task_can_be_explicitly_set_as_host_keyframe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "delivered.png"
+            image_path.write_bytes(base64.b64decode(PNG_1X1))
+            events = [{
+                "task_id": "task-frame-1",
+                "timestamp": 1,
+                "status": "success",
+                "unique_name": "panel-a",
+                "output_path": str(image_path),
+            }]
+            with patch.object(plugin, "_read_async_task_events", return_value=events), \
+                    patch.object(plugin, "_call_host_tool", return_value={"success": True}) as host_call, \
+                    patch.object(plugin, "_record_async_task") as record:
+                result = plugin._set_task_frame("task-frame-1", "first")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["message"], "已设为分镜首帧")
+            host_call.assert_called_once_with("zzdh_set_first_frame", {
+                "unique_name": "panel-a", "image_path": str(image_path.resolve()),
+            })
+            record.assert_called_once_with(
+                "host_frame_linked", task_id="task-frame-1", status="success",
+                host_frame="first", host_frame_path=str(image_path.resolve()),
+            )
+
+    def test_non_delivered_task_cannot_be_set_as_host_keyframe(self):
+        events = [{
+            "task_id": "task-frame-2",
+            "timestamp": 1,
+            "status": "processing",
+            "unique_name": "panel-a",
+            "output_path": "C:/missing.png",
+        }]
+        with patch.object(plugin, "_read_async_task_events", return_value=events), \
+                patch.object(plugin, "_call_host_tool") as host_call:
+            result = plugin._set_task_frame("task-frame-2", "end")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("已交付", result["error"])
+        host_call.assert_not_called()
+
     def test_configured_references_persist_and_clear_from_plugin_state(self):
         original_config_path = plugin._CONFIG_PATH
         original_reference_dir = plugin._CONFIGURED_REFERENCE_DIR

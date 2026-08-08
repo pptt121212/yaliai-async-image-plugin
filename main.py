@@ -1298,6 +1298,9 @@ def handle_action(action, data=None, context=None):
     elif action == "open_local_task_image":
         return _open_local_task_image(data.get("task_id"))
 
+    elif action == "set_task_frame":
+        return _set_task_frame(data.get("task_id"), data.get("frame"))
+
     return {"ok": False, "error": f"未知动作: {action}"}
 
 
@@ -1383,6 +1386,8 @@ def _summarize_async_task_events(events):
             "host_refresh_reason": "",
             "host_refresh_image_index": None,
             "host_refresh_image_version": None,
+            "host_frame": "",
+            "host_frame_path": "",
         })
         summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
         summary["updated_at"] = max(summary["updated_at"], timestamp)
@@ -1396,7 +1401,7 @@ def _summarize_async_task_events(events):
             "generation_round", "output_position", "batch_index", "batch_num", "reference_image_count",
             "shared_reference_prepare_ms", "stage_reference_prepare_ms", "submit_elapsed_ms", "prompt_preview",
             "backup_path", "host_refresh_state", "host_refresh_reason", "host_refresh_image_index",
-            "host_refresh_image_version",
+            "host_refresh_image_version", "host_frame", "host_frame_path",
         ):
             if event.get(key) not in (None, ""):
                 summary[key] = event[key]
@@ -1670,6 +1675,53 @@ def _open_local_task_image(task_id):
     except OSError as exc:
         return {"ok": False, "error": f"无法打开本地图片: {exc}"}
     return {"ok": True, "message": "已使用系统默认图片查看器打开本地图片"}
+
+
+def _set_task_frame(task_id, frame):
+    """Use a delivered task image as the explicitly requested storyboard keyframe."""
+    summary = _find_task_log_summary(task_id)
+    if not summary:
+        return {"ok": False, "error": "未找到任务记录"}
+    if str(summary.get("status", "")).lower() != "success":
+        return {"ok": False, "error": "仅已交付的图片可以设为首尾帧"}
+
+    frame = str(frame or "").strip().lower()
+    tool_name = {
+        "first": "zzdh_set_first_frame",
+        "end": "zzdh_set_end_frame",
+    }.get(frame)
+    if not tool_name:
+        return {"ok": False, "error": "frame 只能是 first 或 end"}
+
+    unique_name = str(summary.get("unique_name", "") or "").strip()
+    if not unique_name:
+        return {"ok": False, "error": "该任务没有可关联的分镜"}
+    path = Path(str(summary.get("output_path", "") or ""))
+    if not path.is_file() or path.stat().st_size <= 0:
+        return {"ok": False, "error": "本地图片文件不存在"}
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except Exception as exc:
+        return {"ok": False, "error": f"本地图片无法读取: {exc}"}
+
+    try:
+        _call_host_tool(tool_name, {
+            "unique_name": unique_name,
+            "image_path": str(path.resolve()),
+        })
+    except Exception as exc:
+        return {"ok": False, "error": f"写入宿主{('首帧' if frame == 'first' else '尾帧')}失败: {exc}"}
+
+    label = "首帧" if frame == "first" else "尾帧"
+    _record_async_task(
+        "host_frame_linked",
+        task_id=str(summary["task_id"]),
+        status="success",
+        host_frame=frame,
+        host_frame_path=str(path.resolve()),
+    )
+    return {"ok": True, "message": f"已设为分镜{label}"}
 
 
 def _file_fingerprint(path):
