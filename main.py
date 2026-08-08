@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-鸭梨 AI 图像生成插件
+字字动画免费图像生成插件（自定义API版本）
 
 参数同步：
 - 在字字动画中运行时，配置和插件状态保存在 user_resources/plugins/
@@ -1318,7 +1318,7 @@ def get_params():
 
 def get_info():
     return {
-        "name": "鸭梨AI图像生成插件(低价版)",
+        "name": "字字动画免费图像生成插件（自定义API版本）",
         "description": "通过鸭梨 AI 网关异步生成图片，支持 Gemini 原生接口、OpenAI Images 文件上传和任务日志。",
         "version": "3.3.0",
         "author": "Yali AI",
@@ -3798,7 +3798,7 @@ def generate(context):
                 pass
 
     print("\n" + "=" * 60)
-    print("鸭梨 AI 图像生成插件开始异步任务")
+    print("字字动画免费图像生成插件开始异步任务")
     print("=" * 60)
     print(f"模型: {model}; 比例: {aspect_ratio}; 档位: {image_size}; 画质: {quality}; 批次: {batch_num}")
     if generation_mode == "upscale":
