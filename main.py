@@ -80,6 +80,8 @@ _TASK_THUMBNAIL_DIR = _STATE_DIR / "task_thumbnails"
 _manual_upscale_jobs_lock = threading.Lock()
 _manual_upscale_jobs = set()
 _GATEWAY_ENDPOINT = "https://api.yaliai.com"
+_HOST_TOOL_CALL_ENDPOINT = "http://127.0.0.1:8766/v1/tools/call"
+_HOST_TOOL_CALL_TIMEOUT_SECONDS = 12
 _OPENAI_IMAGE_OUTPUT_FORMAT = "jpeg"
 _DEFAULT_UPSCALE_PROMPT = (
     "现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。"
@@ -1377,6 +1379,10 @@ def _summarize_async_task_events(events):
             "submit_elapsed_ms": 0,
             "prompt_preview": "",
             "backup_path": "",
+            "host_refresh_state": "",
+            "host_refresh_reason": "",
+            "host_refresh_image_index": None,
+            "host_refresh_image_version": None,
         })
         summary["created_at"] = min(summary["created_at"], timestamp) if timestamp else summary["created_at"]
         summary["updated_at"] = max(summary["updated_at"], timestamp)
@@ -1389,7 +1395,8 @@ def _summarize_async_task_events(events):
             "source_model", "source_task_id", "viewer_index", "unique_name",
             "generation_round", "output_position", "batch_index", "batch_num", "reference_image_count",
             "shared_reference_prepare_ms", "stage_reference_prepare_ms", "submit_elapsed_ms", "prompt_preview",
-            "backup_path",
+            "backup_path", "host_refresh_state", "host_refresh_reason", "host_refresh_image_index",
+            "host_refresh_image_version",
         ):
             if event.get(key) not in (None, ""):
                 summary[key] = event[key]
@@ -1676,6 +1683,92 @@ def _file_fingerprint(path):
     return f"{stat.st_size}:{stat.st_mtime_ns}:{digest.hexdigest()}"
 
 
+def _same_local_path(left, right):
+    """Compare host file paths without depending on their spelling or case."""
+    try:
+        return os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(os.path.abspath(os.fspath(right)))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _call_host_tool(name, arguments):
+    """Call the host's documented local tools endpoint, never a private host API."""
+    endpoint = str(os.environ.get("YALIAI_HOST_TOOL_CALL_ENDPOINT", _HOST_TOOL_CALL_ENDPOINT) or "").strip()
+    if not endpoint:
+        raise RuntimeError("宿主工具端点未配置")
+    response = requests.post(
+        endpoint,
+        json={"name": str(name), "arguments": dict(arguments or {})},
+        timeout=_HOST_TOOL_CALL_TIMEOUT_SECONDS,
+    )
+    status_code = _safe_int(getattr(response, "status_code", 0), 0)
+    if status_code < 200 or status_code >= 300:
+        raise RuntimeError(f"宿主工具 HTTP {status_code}: {str(getattr(response, 'text', ''))[:240]}")
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"宿主工具返回非 JSON 数据: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("宿主工具返回格式无效")
+    if payload.get("success") is False or payload.get("ok") is False:
+        raise RuntimeError(str(payload.get("error") or "宿主工具执行失败"))
+    return payload
+
+
+def _refresh_host_image_after_manual_upscale(source, unique_name):
+    """Refresh only the host's still-selected source asset after an in-place replacement.
+
+    ``zzdh_import_image_from_path`` is the documented host operation that updates
+    the media version and broadcasts a refresh to the canvas. It has no image
+    index argument, so importing an arbitrary older task could replace the wrong
+    slot. Requiring an exact match with the selected asset avoids that race.
+    """
+    source = Path(source)
+    unique_name = str(unique_name or "").strip()
+    if not unique_name:
+        return {"state": "skipped", "reason": "任务缺少分镜标识"}
+    if not source.is_file():
+        return {"state": "skipped", "reason": "超分结果文件不存在"}
+
+    try:
+        before = _call_host_tool("zzdh_get_edit_view_data", {"unique_name": unique_name})
+        images = before.get("images")
+        selected_index = _safe_int(before.get("selected_index", -1), -1)
+        if not isinstance(images, list) or selected_index < 0 or selected_index >= len(images):
+            return {"state": "skipped", "reason": "宿主未找到当前选中图片"}
+        selected = images[selected_index] if isinstance(images[selected_index], dict) else {}
+        selected_path = selected.get("path", "")
+        if not _same_local_path(selected_path, source):
+            return {
+                "state": "skipped",
+                "reason": "分镜当前图片已变化，未覆盖后续结果",
+                "selected_path": str(selected_path or ""),
+            }
+
+        refreshed = _call_host_tool(
+            "zzdh_import_image_from_path",
+            {"unique_name": unique_name, "image_path": str(source.resolve())},
+        )
+        refreshed_index = _safe_int(refreshed.get("image_index", -1), -1)
+        if refreshed_index != selected_index:
+            raise RuntimeError("宿主刷新返回了非当前图片槽位")
+        after = _call_host_tool("zzdh_get_edit_view_data", {"unique_name": unique_name})
+        after_images = after.get("images")
+        if not isinstance(after_images, list) or refreshed_index >= len(after_images):
+            raise RuntimeError("宿主刷新后未返回目标图片")
+        updated = after_images[refreshed_index] if isinstance(after_images[refreshed_index], dict) else {}
+        return {
+            "state": "refreshed",
+            "image_index": refreshed_index,
+            "image_version": updated.get("version"),
+            "path": str(updated.get("path") or ""),
+        }
+    except Exception as exc:
+        # The image replacement has already succeeded. A disconnected host must
+        # not turn that completed, billable upstream job into a failed task.
+        return {"state": "unavailable", "reason": str(exc)}
+
+
 def _find_task_log_summary(task_id):
     wanted = str(task_id or "").strip()
     if not wanted:
@@ -1845,6 +1938,9 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
             shutil.copy2(source, backup_path)
             os.replace(staged_path, source)
 
+        host_refresh = _refresh_host_image_after_manual_upscale(
+            source, metadata.get("unique_name")
+        )
         _record_async_task(
             "manual_upscale_replaced",
             task_id=gateway_task_id,
@@ -1853,10 +1949,17 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
             output_url=output_url,
             output_type=output.get("type", ""),
             backup_path=str(backup_path.resolve()),
+            host_refresh_state=host_refresh.get("state", ""),
+            host_refresh_reason=host_refresh.get("reason", ""),
+            host_refresh_image_index=host_refresh.get("image_index"),
+            host_refresh_image_version=host_refresh.get("image_version"),
             **metadata,
         )
         _persist_task_thumbnail(gateway_task_id, source)
-        print(f"[Yali AI Image] 超分已替换: {source}")
+        if host_refresh.get("state") == "refreshed":
+            print(f"[Yali AI Image] 超分已替换并刷新分镜: {source}")
+        else:
+            print(f"[Yali AI Image] 超分已替换，分镜未刷新: {source} ({host_refresh.get('reason', '')})")
     except Exception as exc:
         _record_async_task(
             "manual_upscale_failed",

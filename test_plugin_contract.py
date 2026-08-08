@@ -126,6 +126,67 @@ class PluginContractTests(unittest.TestCase):
             plugin._global_params.clear()
             plugin._global_params.update(original_params)
 
+    def test_manual_upscale_refreshes_the_host_selected_asset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "panel.png"
+            source.write_bytes(base64.b64decode(PNG_1X1))
+            calls = []
+
+            def fake_post(url, **kwargs):
+                calls.append((url, kwargs["json"]))
+                tool = kwargs["json"]["name"]
+                if tool == "zzdh_get_edit_view_data" and len(calls) == 1:
+                    return _Response(200, {
+                        "images": [{"path": str(source), "version": 10}],
+                        "selected_index": 0,
+                    })
+                if tool == "zzdh_import_image_from_path":
+                    return _Response(200, {"unique_name": "panel-a", "image_index": 0})
+                if tool == "zzdh_get_edit_view_data":
+                    return _Response(200, {
+                        "images": [{"path": str(source), "version": 11}],
+                        "selected_index": 0,
+                    })
+                self.fail(f"unexpected host tool call: {tool}")
+
+            with patch.object(plugin.requests, "post", side_effect=fake_post):
+                result = plugin._refresh_host_image_after_manual_upscale(source, "panel-a")
+
+            self.assertEqual(result["state"], "refreshed")
+            self.assertEqual(result["image_index"], 0)
+            self.assertEqual(result["image_version"], 11)
+            self.assertEqual([item[1]["name"] for item in calls], [
+                "zzdh_get_edit_view_data", "zzdh_import_image_from_path", "zzdh_get_edit_view_data",
+            ])
+            self.assertEqual(calls[1][1]["arguments"]["image_path"], str(source.resolve()))
+
+    def test_manual_upscale_does_not_refresh_a_newer_host_asset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "panel.png"
+            newer = Path(temp_dir) / "newer.png"
+            source.write_bytes(base64.b64decode(PNG_1X1))
+            newer.write_bytes(base64.b64decode(PNG_1X1))
+
+            with patch.object(plugin, "_call_host_tool", return_value={
+                "images": [{"path": str(newer), "version": 12}], "selected_index": 0,
+            }) as host_call:
+                result = plugin._refresh_host_image_after_manual_upscale(source, "panel-a")
+
+            self.assertEqual(result["state"], "skipped")
+            self.assertIn("已变化", result["reason"])
+            host_call.assert_called_once_with("zzdh_get_edit_view_data", {"unique_name": "panel-a"})
+
+    def test_manual_upscale_keeps_success_when_host_refresh_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "panel.png"
+            source.write_bytes(base64.b64decode(PNG_1X1))
+
+            with patch.object(plugin, "_call_host_tool", side_effect=RuntimeError("connection refused")):
+                result = plugin._refresh_host_image_after_manual_upscale(source, "panel-a")
+
+            self.assertEqual(result["state"], "unavailable")
+            self.assertIn("connection refused", result["reason"])
+
     def test_configured_references_persist_and_clear_from_plugin_state(self):
         original_config_path = plugin._CONFIG_PATH
         original_reference_dir = plugin._CONFIGURED_REFERENCE_DIR
