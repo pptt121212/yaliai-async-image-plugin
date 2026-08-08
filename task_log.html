@@ -33,7 +33,6 @@
     .missing-preview { width: 96px; min-height: 50px; padding: 5px; background: var(--bg-secondary); color: var(--text-muted); font-size: 11px; line-height: 1.35; }
     .error { color: var(--danger); }
     .upscale-btn { margin-top: 7px; width: 100%; font-size: 12px; }
-    .local-open-btn { margin-top: 5px; width: 100%; font-size: 12px; }
     .upscaled-badge { display: inline-block; margin-top: 7px; color: var(--text-muted); font-size: 12px; }
     .in-progress { display: inline-block; margin-top: 7px; color: var(--primary-color); font-size: 12px; }
     .batch-upscale-btn { white-space: nowrap; }
@@ -157,11 +156,6 @@
       if (!value) return '-'
       return new Date(Number(value) * 1000).toLocaleString()
     }
-    function localFileUrl(value) {
-      if (!value) return ''
-      if (/^https?:\/\//i.test(value)) return value
-      return 'file:///' + String(value).replace(/\\/g, '/')
-    }
     function storyboardReference(task) {
       var uniqueName = String(task.unique_name || '').trim()
       var viewerIndex = Number(task.viewer_index || 0)
@@ -247,8 +241,6 @@
         var image = localImageUrl ? '<div class="image-item"><div class="image-label">' + (sourceTask ? (manualWorkflow ? '超分结果' : '超分图') : '结果图') + '</div><img class="preview" src="' + esc(localImageUrl) + '" alt="本地图片缩略图"></div>' : ''
         var sourceLabel = manualWorkflow ? '原图' : '基础图'
         var sourceImage = sourceTask ? (sourceImageUrl ? '<div class="image-item"><div class="image-label">' + sourceLabel + '</div><img class="preview" src="' + esc(sourceImageUrl) + '" alt="原图缩略图"></div>' : '<div class="image-item"><div class="image-label">' + sourceLabel + '</div><div class="missing-preview">本地预览已清理</div></div>') : ''
-        var localLink = task.local_image_exists ? '<button class="local-open-btn" type="button" data-open-local-task="' + esc(task.task_id) + '">在本地打开</button>' : ''
-        var sourceLocalLink = sourceTask && sourceTask.local_image_exists && !task.local_image_exists ? '<button class="local-open-btn" type="button" data-open-local-task="' + esc(sourceTask.task_id) + '">在本地打开原图</button>' : ''
         var links = (task.output_urls || []).map(function (url) {
           return '<a href="' + esc(url) + '" target="_blank" rel="noreferrer">打开图片 URL</a>'
         }).join('')
@@ -260,7 +252,7 @@
         var action = canUpscale ? '<button class="upscale-btn" type="button" data-upscale-task="' + esc(task.task_id) + '">超分并替换</button>' : ''
         var stateLabel = task.upscale_state === 'already_upscaled' ? '<span class="upscaled-badge">已超分</span>' : (task.upscale_state === 'superseded' ? '<span class="upscaled-badge">已被后续结果替换</span>' : '')
         var processingHint = isManualPending ? '<span class="in-progress">超分处理中，完成后自动替换原图</span>' : ''
-        var result = (sourceTask ? '<div class="image-pair">' + sourceImage + image + '</div>' : image) + localLink + sourceLocalLink + sourceLinks + links + processingHint + action + stateLabel + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
+        var result = (sourceTask ? '<div class="image-pair">' + sourceImage + image + '</div>' : image) + sourceLinks + links + processingHint + action + stateLabel + (task.error ? '<span class="error">' + esc(task.error) + '</span>' : '')
         var stage = task.pipeline_stage === 'source' ? 'A 中间' : (task.pipeline_stage === 'upscale' ? 'B 最终' : (task.pipeline_stage === 'manual_upscale' ? '手动超分' : '单阶段'))
         var settings = esc(stage) + '<br>' + esc(task.model || '-') + '<br>' + esc(task.request_size || task.image_size || '-') + ' / ' + esc(task.aspect_ratio || '-') + '<br>画质 ' + esc(task.quality || '-') + '<br>参考图 ' + esc(task.reference_image_count || 0)
         if (sourceTask) settings = (manualWorkflow ? '原图<br>' : 'A 基础<br>') + esc(sourceTask.model || '-') + '<br>' + esc(sourceTask.request_size || sourceTask.image_size || '-') + ' / ' + esc(sourceTask.aspect_ratio || '-') + '<hr>' + (manualWorkflow ? '手动超分<br>' : 'B 超分<br>') + settings
@@ -307,10 +299,6 @@
         setActionStatus(data.error || '批量超分无法提交', true)
       }
     })
-    PopupComm.onAction('open_local_task_image', function (data) {
-      if (data && data.ok) setActionStatus(data.message || '已打开本地图片', false)
-      else if (data) setActionStatus(data.error || '无法打开本地图片', true)
-    })
     document.getElementById('searchBtn').addEventListener('click', function () { page = 1; loadLogs() })
     statusFilter.addEventListener('change', function () { page = 1; loadLogs() })
     taskIdInput.addEventListener('keydown', function (event) { if (event.key === 'Enter') { page = 1; loadLogs() } })
@@ -323,12 +311,6 @@
       if (window.confirm('清空全部任务日志？不会删除图片文件。')) PopupComm.send('clear_task_logs', { mode: 'all' })
     })
     logBody.addEventListener('click', function (event) {
-      var localButton = event.target.closest('[data-open-local-task]')
-      if (localButton) {
-        setActionStatus('正在打开本地图片...', false)
-        PopupComm.send('open_local_task_image', { task_id: localButton.getAttribute('data-open-local-task') })
-        return
-      }
       var checkbox = event.target.closest('[data-task-select]')
       if (checkbox) {
         var selectedId = String(checkbox.getAttribute('data-task-select'))

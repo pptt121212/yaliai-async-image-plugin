@@ -803,6 +803,12 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("window.addEventListener('focus'", task_log_html)
         self.assertIn("clearTimeout(logLoadRetryTimer)", task_log_html)
 
+    def test_task_log_does_not_open_local_images_from_popup(self):
+        task_log_html = (PLUGIN_PATH.parent / "ui" / "task_log.html").read_text(encoding="utf-8")
+        self.assertNotIn("local-open-btn", task_log_html)
+        self.assertNotIn("open_local_task_image", task_log_html)
+        self.assertNotIn("正在打开本地图片", task_log_html)
+
     def test_generation_target_metadata_marks_entity_entry_points(self):
         self.assertEqual(
             plugin._generation_target_metadata({"unique_name": "character_2", "viewer_index": 0}),
