@@ -376,7 +376,6 @@
       updateUpscaleVisibility()
       if (persist && sdkReady) {
         try { PluginSDK.saveParam('generation_mode', currentGenerationMode) } catch (error) {}
-        PluginSDK.sendAction('save_param', { key: 'generation_mode', value: currentGenerationMode })
       }
     }
 
@@ -394,7 +393,6 @@
       if (!sdkReady) return
       var value = String(fields[key].value || '').trim()
       try { PluginSDK.saveParam(key, value) } catch (error) {}
-      PluginSDK.sendAction('save_param', { key: key, value: value })
     }
 
     function applyParams(params) {
@@ -454,7 +452,7 @@
       checkPluginUpdate.disabled = true
       checkPluginUpdate.textContent = '检查中...'
       setUpdateStatus('正在检查更新...', false)
-      PluginSDK.sendAction('check_plugin_update').then(function (result) {
+      PluginSDK.sendAction('check_plugin_update', {}, { timeoutMs: 30000 }).then(function (result) {
         if (!result || result.ok === false) throw new Error((result && result.error) || '检查更新失败')
         if (!result.has_update) {
           setUpdateStatus(result.message || '当前已是最新版本', false)
@@ -475,7 +473,7 @@
             download_url: pendingPluginUpdate.download_url,
             sha256: pendingPluginUpdate.sha256,
             remote_version: pendingPluginUpdate.remote_version
-          }).then(function (installResult) {
+          }, { timeoutMs: 180000 }).then(function (installResult) {
             if (!installResult || installResult.ok === false) throw new Error((installResult && installResult.error) || '安装更新失败')
             pendingPluginUpdate = null
             setUpdateStatus(installResult.message || '更新成功，请重启字字动画', false)
@@ -505,8 +503,12 @@
     PluginSDK.onAction('load_params', function (result) { if (result && result.ok) applyParams(result.params) })
     document.getElementById('openTaskLog').addEventListener('click', function () {
       if (!sdkReady) return
-      PluginSDK.sendAction('open_task_logs').then(function (result) {
-        if (!result || result.ok === false) setStatus((result && result.error) || '无法打开任务日志', true)
+      PluginSDK.sendAction('open_task_logs', {}, { timeoutMs: 15000 }).then(function (result) {
+        // The host may create the popup before its iframe reply reaches this
+        // panel. Do not turn that completed UI action into a false failure.
+        if (result && result.ok === false && result.error !== '后端未返回插件动作结果：请确认宿主后端已启动，或稍后重试。') {
+          setStatus(result.error || '无法打开任务日志', true)
+        }
       })
     })
     referenceInput.addEventListener('change', function () {

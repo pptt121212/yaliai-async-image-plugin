@@ -125,7 +125,7 @@ https://api.yaliai.com/downloads/yaliai-async-image-plugin-update.json
 
 ```json
 {
-  "version": "3.4.2",
+  "version": "3.4.3",
   "download_url": "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
   "sha256": "完整 ZIP 文件的 SHA-256",
   "notes": "更新说明"
