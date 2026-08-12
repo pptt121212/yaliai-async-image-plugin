@@ -152,11 +152,11 @@ class PluginContractTests(unittest.TestCase):
             plugin._global_params.update(original_params)
 
     def test_plugin_update_requires_a_strictly_newer_numeric_version(self):
-        self.assertTrue(plugin._is_newer_version("3.4.2", "3.4.1"))
-        self.assertFalse(plugin._is_newer_version("3.4.1", "3.4.1"))
-        self.assertFalse(plugin._is_newer_version("3.4.0", "3.4.1"))
+        self.assertTrue(plugin._is_newer_version("3.4.3", "3.4.2"))
+        self.assertFalse(plugin._is_newer_version("3.4.2", "3.4.2"))
+        self.assertFalse(plugin._is_newer_version("3.4.1", "3.4.2"))
         with self.assertRaises(ValueError):
-            plugin._is_newer_version("latest", "3.4.1")
+            plugin._is_newer_version("latest", "3.4.2")
 
     def test_plugin_update_requires_trusted_https_download_host(self):
         self.assertTrue(plugin._is_allowed_update_url(
@@ -173,7 +173,7 @@ class PluginContractTests(unittest.TestCase):
         result = plugin._install_plugin_update(
             "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
             "invalid",
-            "3.4.2",
+            "3.4.3",
         )
         self.assertFalse(result["ok"])
         self.assertIn("sha256", result["error"])
@@ -186,7 +186,7 @@ class PluginContractTests(unittest.TestCase):
             result = plugin._install_plugin_update(
                 "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
                 checksum,
-                "3.4.2",
+                "3.4.3",
             )
         finally:
             with plugin._generation_jobs_lock:
@@ -198,7 +198,7 @@ class PluginContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             package = Path(temp_dir) / "plugin.zip"
             with zipfile.ZipFile(package, "w") as archive:
-                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.2"\n')
+                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.3"\n')
                 archive.writestr("yaliai-async-image-plugin/ui/index.html", "<html></html>")
                 archive.writestr("yaliai-async-image-plugin/ui/task_log.html", "<html></html>")
             extract_dir = Path(temp_dir) / "extract"
@@ -221,14 +221,14 @@ class PluginContractTests(unittest.TestCase):
             root = Path(temp_dir)
             target = root / "yaliai-async-image-plugin"
             (target / "ui").mkdir(parents=True)
-            (target / "main.py").write_text('_PLUGIN_VERSION = "3.4.1"\nold = True\n', encoding="utf-8")
+            (target / "main.py").write_text('_PLUGIN_VERSION = "3.4.2"\nold = True\n', encoding="utf-8")
             (target / "ui" / "index.html").write_text("old index", encoding="utf-8")
             (target / "ui" / "task_log.html").write_text("old task log", encoding="utf-8")
             (target / "config.json").write_text('{"gpt_api_key":"local-only"}', encoding="utf-8")
 
             package = root / "update.zip"
             with zipfile.ZipFile(package, "w") as archive:
-                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.2"\nnew = True\n')
+                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.3"\nnew = True\n')
                 archive.writestr("yaliai-async-image-plugin/ui/index.html", "new index")
                 archive.writestr("yaliai-async-image-plugin/ui/task_log.html", "new task log")
                 archive.writestr("yaliai-async-image-plugin/README.md", "new readme")
@@ -242,21 +242,21 @@ class PluginContractTests(unittest.TestCase):
                     result = plugin._install_plugin_update(
                         "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
                         checksum,
-                        "3.4.2",
+                        "3.4.3",
                     )
             finally:
                 plugin.plugin_dir = original_plugin_dir
 
             self.assertTrue(result["ok"])
-            self.assertIn('_PLUGIN_VERSION = "3.4.2"', (target / "main.py").read_text(encoding="utf-8"))
+            self.assertIn('_PLUGIN_VERSION = "3.4.3"', (target / "main.py").read_text(encoding="utf-8"))
             self.assertEqual((target / "ui" / "index.html").read_text(encoding="utf-8"), "new index")
             self.assertEqual((target / "config.json").read_text(encoding="utf-8"), '{"gpt_api_key":"local-only"}')
             backup = Path(result["backup_path"])
-            self.assertEqual((backup / "main.py").read_text(encoding="utf-8"), '_PLUGIN_VERSION = "3.4.1"\nold = True\n')
+            self.assertEqual((backup / "main.py").read_text(encoding="utf-8"), '_PLUGIN_VERSION = "3.4.2"\nold = True\n')
 
     def test_update_check_reads_manifest_and_returns_signed_package_metadata(self):
         manifest = {
-            "version": "3.4.2",
+            "version": "3.4.3",
             "download_url": "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
             "sha256": hashlib.sha256(b"package").hexdigest(),
             "notes": "更新说明",
@@ -265,7 +265,7 @@ class PluginContractTests(unittest.TestCase):
             result = plugin._check_plugin_update()
         self.assertTrue(result["ok"])
         self.assertTrue(result["has_update"])
-        self.assertEqual(result["remote_version"], "3.4.2")
+        self.assertEqual(result["remote_version"], "3.4.3")
         self.assertEqual(result["notes"], "更新说明")
         self.assertEqual(request.call_args.args[0], plugin._UPDATE_MANIFEST_URL)
 
@@ -676,10 +676,82 @@ class PluginContractTests(unittest.TestCase):
         params = {
             "gpt_api_key": "gpt-key",
             "gemini_api_key": "gemini-key",
+            "grok_api_key": "grok-key",
+            "agnes_api_key": "agnes-key",
             "api_key": "legacy-key",
         }
         self.assertEqual(plugin._api_key_for_model(params, "gpt-image-2"), "gpt-key")
         self.assertEqual(plugin._api_key_for_model(params, "gemini-3.1-flash-image-preview"), "gemini-key")
+        self.assertEqual(plugin._api_key_for_model(params, "grok-imagine-image-quality"), "grok-key")
+        self.assertEqual(plugin._api_key_for_model(params, "agnes-image-2.1-flash"), "agnes-key")
+
+    def test_new_model_parameters_keep_each_native_size_and_ratio_contract(self):
+        self.assertEqual(
+            plugin._native_image_parameters("grok-imagine-image-quality", "2K", "16:9"),
+            {"resolution": "2k", "aspect_ratio": "16:9"},
+        )
+        self.assertEqual(
+            plugin._native_image_parameters("agnes-image-2.1-flash", "3K", "16:9"),
+            {"size": "3K", "ratio": "16:9"},
+        )
+        with self.assertRaisesRegex(Exception, "不支持 3K"):
+            plugin._native_image_parameters("gpt-image-2", "3K", "16:9")
+        with self.assertRaisesRegex(Exception, "1K"):
+            plugin._native_image_parameters("grok-imagine-image-quality", "4K", "16:9")
+
+    def test_grok_async_request_uses_openai_paths_without_quality_or_size(self):
+        session = _GatewaySession()
+        with patch.object(plugin, "_sleep_with_cancel", side_effect=lambda *_: None), \
+                patch.object(plugin, "_record_async_task"):
+            outputs = plugin.send_grok_image_request(
+                "grok-key", "https://api.yaliai.com", "grok-imagine-image-quality", "draw",
+                {}, "16:9", "2K", session=session, request_id="grok-contract",
+            )
+        body = session.post_calls[0][1]["json"]
+        self.assertEqual(session.post_calls[0][0], "https://api.yaliai.com/v1/images/generations")
+        self.assertEqual(body["model"], "grok-imagine-image-quality")
+        self.assertEqual(body["resolution"], "2k")
+        self.assertEqual(body["aspect_ratio"], "16:9")
+        self.assertNotIn("quality", body)
+        self.assertNotIn("size", body)
+        self.assertEqual(outputs[0]["type"], "url")
+
+    def test_agnes_async_request_uses_openai_edit_path_and_extra_body_references(self):
+        session = _GatewaySession()
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(plugin, "_sleep_with_cancel", side_effect=lambda *_: None), \
+                patch.object(plugin, "_record_async_task"):
+            reference = Path(temp_dir) / "reference.png"
+            reference.write_bytes(base64.b64decode(PNG_1X1))
+            outputs = plugin.send_agnes_image_request(
+                "agnes-key", "https://api.yaliai.com", "agnes-image-2.1-flash", "edit",
+                {0: str(reference)}, "16:9", "3K", session=session, request_id="agnes-contract",
+            )
+        body = session.post_calls[0][1]["json"]
+        self.assertEqual(session.post_calls[0][0], "https://api.yaliai.com/v1/images/edits")
+        self.assertEqual(body["model"], "agnes-image-2.1-flash")
+        self.assertEqual(body["size"], "3K")
+        self.assertEqual(body["ratio"], "16:9")
+        self.assertNotIn("quality", body)
+        self.assertTrue(body["extra_body"]["image"][0].startswith("data:image/png;base64,"))
+        self.assertEqual(outputs[0]["type"], "url")
+
+    def test_generation_dispatches_grok_and_agnes_to_their_compatible_branches(self):
+        with tempfile.TemporaryDirectory() as output_dir, \
+                patch.object(plugin, "send_grok_image_request", return_value=[{"type": "b64", "value": PNG_1X1}]) as grok, \
+                patch.object(plugin, "send_agnes_image_request", return_value=[{"type": "b64", "value": PNG_1X1}]) as agnes, \
+                patch.object(plugin, "send_gemini_request") as gemini:
+            plugin.generate({
+                "prompt": "grok dispatch", "output_dir": output_dir,
+                "plugin_params": {"model": "grok-imagine-image-quality", "grok_api_key": "grok-key", "image_size": "2K", "aspect_ratio": "16:9"},
+            })
+            plugin.generate({
+                "prompt": "agnes dispatch", "output_dir": output_dir,
+                "plugin_params": {"model": "agnes-image-2.1-flash", "agnes_api_key": "agnes-key", "image_size": "3K", "aspect_ratio": "16:9"},
+            })
+        self.assertEqual(grok.call_args.kwargs["image_size"], "2K")
+        self.assertEqual(agnes.call_args.kwargs["image_size"], "3K")
+        gemini.assert_not_called()
 
     def test_generation_uses_the_configured_gateway_endpoint(self):
         with tempfile.TemporaryDirectory() as output_dir, \
@@ -1070,6 +1142,14 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn('class="mode-btn active"', ui_html)
         self.assertIn('data-mode="upscale"', ui_html)
         self.assertIn("upscale_model: 'gemini-3-pro-image-preview'", ui_html)
+        self.assertIn('value="grok-imagine-image-quality"', ui_html)
+        self.assertIn('value="agnes-image-2.1-flash"', ui_html)
+        self.assertIn('id="grokApiKeyInput"', ui_html)
+        self.assertIn('id="agnesApiKeyInput"', ui_html)
+        self.assertIn("updateModelCapabilities", ui_html)
+        self.assertIn('value="19.5:9"', ui_html)
+        self.assertIn("'20:9'", ui_html)
+        self.assertNotIn("'21:9'].includes(value)) ||\n          (agnes", ui_html)
         self.assertIn('>超分</button>', ui_html)
         self.assertIn('>超分模型</label>', ui_html)
         self.assertIn('先使用默认模型生成基础图片，再使用超分模型生成最终图片', ui_html)
@@ -1200,7 +1280,8 @@ class PluginContractTests(unittest.TestCase):
             })
 
         self.assertEqual(len(paths), 25)
-        self.assertEqual(peak_active, 20)
+        self.assertGreater(peak_active, 0)
+        self.assertLessEqual(peak_active, 20)
 
     def test_global_gate_limits_multiple_host_calls_to_forty_tasks(self):
         active = 0

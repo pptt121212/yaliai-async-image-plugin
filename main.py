@@ -84,7 +84,7 @@ _GATEWAY_ENDPOINT = "https://api.yaliai.com"
 _HOST_TOOL_CALL_ENDPOINT = "http://127.0.0.1:8766/v1/tools/call"
 _HOST_TOOL_CALL_TIMEOUT_SECONDS = 12
 _OPENAI_IMAGE_OUTPUT_FORMAT = "jpeg"
-_PLUGIN_VERSION = "3.4.1"
+_PLUGIN_VERSION = "3.4.2"
 _UPDATE_MANIFEST_URL = "https://api.yaliai.com/downloads/yaliai-async-image-plugin-update.json"
 _UPDATE_ALLOWED_HOSTS = {"api.yaliai.com"}
 _UPDATE_MAX_PACKAGE_BYTES = 100 * 1024 * 1024
@@ -527,6 +527,8 @@ _default_params = {
     "endpoint": _GATEWAY_ENDPOINT,
     "gpt_api_key": "",
     "gemini_api_key": "",
+    "grok_api_key": "",
+    "agnes_api_key": "",
     "model": "gemini-3.1-flash-image-preview",
     "aspect_ratio": "16:9",
     "image_size": "4K",
@@ -659,6 +661,8 @@ AVAILABLE_MODELS = [
     "gemini-3.1-flash-image-preview",
     "gemini-3-pro-image-preview",
     "gpt-image-2",
+    "grok-imagine-image-quality",
+    "agnes-image-2.1-flash",
 ]
 
 GEMINI_MODELS = {
@@ -668,6 +672,14 @@ GEMINI_MODELS = {
 
 GPT_IMAGE_MODELS = {
     "gpt-image-2",
+}
+
+GROK_IMAGE_MODELS = {
+    "grok-imagine-image-quality",
+}
+
+AGNES_IMAGE_MODELS = {
+    "agnes-image-2.1-flash",
 }
 
 ASPECT_RATIOS = [
@@ -682,11 +694,27 @@ ASPECT_RATIOS = [
     "5:4",
     "4:5",
     "21:9",
+    "2:1",
+    "1:2",
+    "19.5:9",
+    "9:19.5",
+    "20:9",
+    "9:20",
 ]
+
+GROK_ASPECT_RATIOS = {
+    "auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+    "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20",
+}
+
+AGNES_ASPECT_RATIOS = {
+    "1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9",
+}
 
 IMAGE_SIZES = [
     "1K",
     "2K",
+    "3K",
     "4K",
 ]
 
@@ -765,7 +793,7 @@ def _clean_empty_credentials(src):
 
     data = dict(src)
 
-    for key in ("api_key", "gpt_api_key", "gemini_api_key"):
+    for key in ("api_key", "gpt_api_key", "gemini_api_key", "grok_api_key", "agnes_api_key"):
         if not str(data.get(key, "") or "").strip():
             data.pop(key, None)
 
@@ -836,9 +864,58 @@ def _normalize_model(model):
     return model
 
 
+def _model_protocol(model):
+    """Return the gateway contract selected by a known plugin model."""
+    if model in GPT_IMAGE_MODELS:
+        return "openai_image"
+    if model in GROK_IMAGE_MODELS:
+        return "grok_image"
+    if model in AGNES_IMAGE_MODELS:
+        return "agnes_image"
+    return "gemini"
+
+
+def _credential_label_for_model(model):
+    protocol = _model_protocol(model)
+    return {
+        "openai_image": "GPT KEY",
+        "grok_image": "GROK KEY",
+        "agnes_image": "AGNES KEY",
+        "gemini": "GEMINI KEY",
+    }[protocol]
+
+
+def _native_image_parameters(model, image_size, aspect_ratio):
+    """Normalize the UI's shared controls to each model's native wire contract."""
+    size = _normalize_image_size(image_size, "4K")
+    ratio = str(aspect_ratio or "auto").strip()
+    protocol = _model_protocol(model)
+    if protocol == "grok_image":
+        if size not in {"1K", "2K"}:
+            raise Exception("grok-imagine-image-quality 只支持 1K 或 2K")
+        if ratio not in GROK_ASPECT_RATIOS:
+            raise Exception(f"grok-imagine-image-quality 不支持比例: {ratio}")
+        return {"resolution": "1k" if size == "1K" else "2k", "aspect_ratio": ratio}
+    if protocol == "agnes_image":
+        if ratio not in AGNES_ASPECT_RATIOS:
+            raise Exception(f"agnes-image-2.1-flash 不支持比例: {ratio}")
+        return {"size": size, "ratio": ratio}
+    if size == "3K":
+        label = "gpt-image-2" if protocol == "openai_image" else "Gemini"
+        raise Exception(f"{label} 不支持 3K，请选择 1K、2K 或 4K")
+    if protocol == "openai_image":
+        build_gpt_image_size(ratio, size)
+    return {"size": size, "ratio": ratio}
+
+
 def _api_key_for_model(params, model):
     """Select the model-family credential while accepting a pre-v3 config."""
-    key_name = "gpt_api_key" if model in GPT_IMAGE_MODELS else "gemini_api_key"
+    key_name = {
+        "openai_image": "gpt_api_key",
+        "grok_image": "grok_api_key",
+        "agnes_image": "agnes_api_key",
+        "gemini": "gemini_api_key",
+    }[_model_protocol(model)]
     api_key = str(params.get(key_name, "") or "").strip()
     if api_key:
         return api_key
@@ -1576,7 +1653,7 @@ def get_params():
 def get_info():
     return {
         "name": "鸭梨AI图像生成插件（异步接口版）",
-        "description": "通过鸭梨 AI 网关异步生成图片，支持 Gemini 原生接口、OpenAI Images 文件上传和任务日志。",
+        "description": "通过鸭梨 AI 网关异步生成图片，支持 OpenAI、Gemini、Grok、Agnes 与任务日志。",
         "version": _PLUGIN_VERSION,
         "author": "Yali AI",
     }
@@ -2419,7 +2496,7 @@ def _manual_upscale_metadata(summary, params, source_task_id, source_path):
         "quality": str(params.get("quality", "medium") or "medium").strip().lower(),
         "image_size": image_size,
         "aspect_ratio": aspect_ratio,
-        "protocol": "openai_image" if upscale_model in GPT_IMAGE_MODELS else "gemini",
+        "protocol": _model_protocol(upscale_model),
         "generation_mode": "manual_upscale",
         "pipeline_stage": "manual_upscale",
         "upscale_target_image_size": image_size,
@@ -2475,9 +2552,10 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
             **metadata,
         )
         model = metadata["model"]
+        _native_image_parameters(model, metadata["image_size"], metadata["aspect_ratio"])
         api_key = _api_key_for_model(params, model)
         if not api_key:
-            label = "GPT KEY" if model in GPT_IMAGE_MODELS else "GEMINI KEY"
+            label = _credential_label_for_model(model)
             raise Exception(f"未设置超分模型所需的 {label}")
 
         _local_reference_gate.acquire(lambda: False)
@@ -2492,6 +2570,41 @@ def _run_manual_upscale(summary, source_path, source_key, local_job_id):
         request_id = f"yaliai_plugin_manual_upscale_{uuid.uuid4().hex}"
         if model in GPT_IMAGE_MODELS:
             outputs = send_gpt_image_request(
+                api_key=api_key,
+                endpoint=endpoint,
+                model=model,
+                prompt=prompt,
+                reference_images=prepared_references,
+                aspect_ratio=metadata["aspect_ratio"],
+                image_size=metadata["image_size"],
+                quality=metadata["quality"],
+                request_timeout=_GATEWAY_HTTP_TIMEOUT_SECONDS,
+                download_timeout=_IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+                async_initial_delay=_ASYNC_INITIAL_DELAY_SECONDS,
+                async_poll_interval=_ASYNC_POLL_INTERVAL_SECONDS,
+                async_max_wait=_ASYNC_MAX_WAIT_SECONDS,
+                request_id=request_id,
+                task_metadata=metadata,
+            )
+        elif model in GROK_IMAGE_MODELS:
+            outputs = send_grok_image_request(
+                api_key=api_key,
+                endpoint=endpoint,
+                model=model,
+                prompt=prompt,
+                reference_images=prepared_references,
+                aspect_ratio=metadata["aspect_ratio"],
+                image_size=metadata["image_size"],
+                request_timeout=_GATEWAY_HTTP_TIMEOUT_SECONDS,
+                download_timeout=_IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+                async_initial_delay=_ASYNC_INITIAL_DELAY_SECONDS,
+                async_poll_interval=_ASYNC_POLL_INTERVAL_SECONDS,
+                async_max_wait=_ASYNC_MAX_WAIT_SECONDS,
+                request_id=request_id,
+                task_metadata=metadata,
+            )
+        elif model in AGNES_IMAGE_MODELS:
+            outputs = send_agnes_image_request(
                 api_key=api_key,
                 endpoint=endpoint,
                 model=model,
@@ -3793,6 +3906,135 @@ def send_gpt_image_request(
             session.close()
 
 
+def _send_openai_compatible_async_request(
+    api_key,
+    endpoint,
+    model,
+    prompt,
+    reference_images,
+    common,
+    request_timeout=300,
+    async_initial_delay=30,
+    async_poll_interval=5,
+    async_max_wait=1800,
+    progress=None,
+    session=None,
+    request_id=None,
+    is_cancelled=lambda: False,
+    task_metadata=None,
+):
+    """Submit JSON on the public OpenAI Images paths and poll the durable task."""
+    endpoint = _normalize_endpoint(endpoint)
+    ref_pack = _collect_valid_reference_images(reference_images)
+    local_refs = ref_pack["local"]
+    url_refs = ref_pack["urls"]
+    owns_session = session is None
+    session = session or _new_http_session()
+    request_id = request_id or f"yaliai_plugin_{int(time.time() * 1000)}_{threading.get_ident()}_{uuid.uuid4().hex}"
+    try:
+        if local_refs:
+            # Both native contracts accept Data URLs in their JSON reference
+            # fields. This keeps the plugin independent of an upstream's
+            # optional multipart capability and preserves image ordering.
+            image_values = []
+            for image_path in local_refs:
+                with open(image_path, "rb") as handle:
+                    encoded = base64.b64encode(handle.read()).decode("ascii")
+                image_values.append(f"data:{guess_mime_type(image_path)};base64,{encoded}")
+        else:
+            image_values = list(url_refs)
+
+        if image_values:
+            url = f"{endpoint}/v1/images/edits"
+            payload = dict(common)
+            if model in AGNES_IMAGE_MODELS:
+                extra = dict(payload.get("extra_body") or {})
+                extra["image"] = image_values
+                payload["extra_body"] = extra
+            else:
+                payload["image"] = image_values[0] if len(image_values) == 1 else image_values
+        else:
+            url = f"{endpoint}/v1/images/generations"
+            payload = dict(common)
+
+        accepted = _submit_async_request(
+            session,
+            url,
+            api_key,
+            request_id,
+            request_timeout,
+            json_payload=payload,
+            task_metadata=task_metadata,
+        )
+        return _poll_async_task(
+            session,
+            endpoint,
+            api_key,
+            accepted,
+            request_timeout,
+            async_initial_delay,
+            async_poll_interval,
+            async_max_wait,
+            progress or (lambda *_: None),
+            is_cancelled,
+        )
+    finally:
+        if owns_session:
+            session.close()
+
+
+def send_grok_image_request(
+    api_key, endpoint, model, prompt, reference_images, aspect_ratio="auto", image_size="1K",
+    request_timeout=300, download_timeout=300, async_initial_delay=30, async_poll_interval=5,
+    async_max_wait=1800, progress=None, session=None, request_id=None,
+    is_cancelled=lambda: False, task_metadata=None,
+):
+    """Submit Grok through OpenAI Images paths using only Grok-native fields."""
+    del download_timeout
+    parameters = _native_image_parameters(model, image_size, aspect_ratio)
+    common = {
+        "model": model,
+        "prompt": str(prompt),
+        "resolution": parameters["resolution"],
+        "aspect_ratio": parameters["aspect_ratio"],
+        "response_format": "url",
+        "async": True,
+    }
+    metadata = dict(task_metadata or {})
+    metadata.update({"request_resolution": parameters["resolution"], "request_aspect_ratio": parameters["aspect_ratio"]})
+    return _send_openai_compatible_async_request(
+        api_key, endpoint, model, prompt, reference_images, common, request_timeout,
+        async_initial_delay, async_poll_interval, async_max_wait, progress, session,
+        request_id, is_cancelled, metadata,
+    )
+
+
+def send_agnes_image_request(
+    api_key, endpoint, model, prompt, reference_images, aspect_ratio="1:1", image_size="1K",
+    quality="medium", request_timeout=300, download_timeout=300, async_initial_delay=30,
+    async_poll_interval=5, async_max_wait=1800, progress=None, session=None,
+    request_id=None, is_cancelled=lambda: False, task_metadata=None,
+):
+    """Submit Agnes 2.1 through OpenAI Images paths with its K-tier contract."""
+    del quality, download_timeout
+    parameters = _native_image_parameters(model, image_size, aspect_ratio)
+    common = {
+        "model": model,
+        "prompt": str(prompt),
+        "size": parameters["size"],
+        "ratio": parameters["ratio"],
+        "response_format": "url",
+        "async": True,
+    }
+    metadata = dict(task_metadata or {})
+    metadata.update({"request_size": parameters["size"], "request_ratio": parameters["ratio"]})
+    return _send_openai_compatible_async_request(
+        api_key, endpoint, model, prompt, reference_images, common, request_timeout,
+        async_initial_delay, async_poll_interval, async_max_wait, progress, session,
+        request_id, is_cancelled, metadata,
+    )
+
+
 # ===================== Legacy synchronous entry (unused) =====================
 
 def _legacy_generate(context):
@@ -4017,8 +4259,7 @@ def _generate_impl(context):
     reference_images = _merge_reference_images(reference_images, configured_references)
 
     if not api_key:
-        credential_label = "GPT-image-2 API Key" if model in GPT_IMAGE_MODELS else "Gemini API Key"
-        raise Exception(f"PLUGIN_ERROR:::未设置 {credential_label}")
+        raise Exception(f"PLUGIN_ERROR:::未设置 {_credential_label_for_model(model)}")
     if not endpoint:
         raise Exception("PLUGIN_ERROR:::未设置鸭梨 AI Gateway 地址")
     if not prompt:
@@ -4029,10 +4270,11 @@ def _generate_impl(context):
         raise Exception("PLUGIN_ERROR:::画质必须是 low、medium 或 high")
     if generation_mode not in {"default", "upscale"}:
         raise Exception("PLUGIN_ERROR:::生成模式必须是 default 或 upscale")
+    _native_image_parameters(model, image_size, aspect_ratio)
     if generation_mode == "upscale":
         if should_upscale and not _api_key_for_model(params, upscale_model):
-            credential_label = "GPT-image-2 API Key" if upscale_model in GPT_IMAGE_MODELS else "Gemini API Key"
-            raise Exception(f"PLUGIN_ERROR:::未设置超分模型所需的 {credential_label}")
+            raise Exception(f"PLUGIN_ERROR:::未设置超分模型所需的 {_credential_label_for_model(upscale_model)}")
+        _native_image_parameters(upscale_model, upscale_image_size, aspect_ratio)
         _render_upscale_prompt(upscale_prompt_template, upscale_image_size, aspect_ratio)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -4099,7 +4341,7 @@ def _generate_impl(context):
             "quality": quality,
             "image_size": image_size,
             "aspect_ratio": aspect_ratio,
-            "protocol": "openai_image" if model in GPT_IMAGE_MODELS else "gemini",
+            "protocol": _model_protocol(model),
             "generation_mode": generation_mode,
             "pipeline_stage": "source" if should_upscale else "single",
             "upscale_target_image_size": upscale_image_size,
@@ -4125,6 +4367,7 @@ def _generate_impl(context):
         def request_stage(stage_model, stage_prompt, stage_references, stage_request_id, stage_metadata, start_percent, end_percent, stage_image_size, references_prepared=False):
             if is_cancelled():
                 raise Exception("任务已被宿主取消")
+            _native_image_parameters(stage_model, stage_image_size, aspect_ratio)
             preparation_started = time.monotonic()
             progress("准备参考图", max(6, start_percent - 2))
             if references_prepared:
@@ -4139,6 +4382,45 @@ def _generate_impl(context):
             try:
                 if stage_model in GPT_IMAGE_MODELS:
                     outputs = send_gpt_image_request(
+                        api_key=_api_key_for_model(params, stage_model),
+                        endpoint=endpoint,
+                        model=stage_model,
+                        prompt=stage_prompt,
+                        reference_images=prepared_references,
+                        aspect_ratio=aspect_ratio,
+                        image_size=stage_image_size,
+                        quality=quality,
+                        request_timeout=request_timeout,
+                        download_timeout=download_timeout,
+                        async_initial_delay=initial_delay,
+                        async_poll_interval=poll_interval,
+                        async_max_wait=max_wait,
+                        progress=stage_progress(start_percent, end_percent),
+                        request_id=stage_request_id,
+                        is_cancelled=is_cancelled,
+                        task_metadata=stage_metadata,
+                    )
+                elif stage_model in GROK_IMAGE_MODELS:
+                    outputs = send_grok_image_request(
+                        api_key=_api_key_for_model(params, stage_model),
+                        endpoint=endpoint,
+                        model=stage_model,
+                        prompt=stage_prompt,
+                        reference_images=prepared_references,
+                        aspect_ratio=aspect_ratio,
+                        image_size=stage_image_size,
+                        request_timeout=request_timeout,
+                        download_timeout=download_timeout,
+                        async_initial_delay=initial_delay,
+                        async_poll_interval=poll_interval,
+                        async_max_wait=max_wait,
+                        progress=stage_progress(start_percent, end_percent),
+                        request_id=stage_request_id,
+                        is_cancelled=is_cancelled,
+                        task_metadata=stage_metadata,
+                    )
+                elif stage_model in AGNES_IMAGE_MODELS:
+                    outputs = send_agnes_image_request(
                         api_key=_api_key_for_model(params, stage_model),
                         endpoint=endpoint,
                         model=stage_model,
@@ -4272,7 +4554,7 @@ def _generate_impl(context):
                 upscale_metadata = dict(source_task_metadata)
                 upscale_metadata.update({
                     "model": upscale_model,
-                    "protocol": "openai_image" if upscale_model in GPT_IMAGE_MODELS else "gemini",
+                    "protocol": _model_protocol(upscale_model),
                     "pipeline_stage": "upscale",
                     "source_model": model,
                     "source_task_id": source_task_id,

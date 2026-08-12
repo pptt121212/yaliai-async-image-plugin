@@ -9,11 +9,13 @@
 
 二、首次配置
 1. 点击插件底部的“设置”打开配置窗口。
-2. 分别填写 GPT-image-2 API Key 和 Gemini API Key。
+2. 按所选模型填写 GPT KEY、GEMINI KEY、GROK KEY 或 AGNES KEY。
 3. API URL 默认是 https://api.yaliai.com，可按实际网关地址修改并保存。
 4. “模型”选择决定使用的接口类型：
    - gpt-image-2：OpenAI Images 接口。
    - gemini-3.1-flash-image-preview、gemini-3-pro-image-preview：Gemini 接口。
+   - grok-imagine-image-quality：OpenAI Images 兼容路径，支持 1K/2K 和合法比例，不提交画质字段。
+   - agnes-image-2.1-flash：OpenAI Images 兼容路径，支持 1K/2K/3K/4K 和合法比例；参考图按 Agnes 字段提交。
 5. 关闭设置窗口后即可在工具的图像生成界面调用。
 6. 参考图不超过 5MB 时原样上传；超过 5MB 时才会按比例压缩到 5MB 以下。原始文件不会被修改，超大原图也会尝试压缩，不会因为文件大小直接拒绝。
 

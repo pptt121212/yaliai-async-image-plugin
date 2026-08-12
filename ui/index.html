@@ -49,6 +49,7 @@
     .update-row button { white-space: nowrap; }
     .update-result { min-height: 18px; margin-top: 7px; color: var(--text-muted); font-size: 11px; line-height: 1.45; }
     .update-result.error { color: var(--danger, #d9534f); }
+    .model-hint { margin: 5px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
   </style>
 </head>
 <body>
@@ -81,7 +82,10 @@
       <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview</option>
       <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
       <option value="gpt-image-2">gpt-image-2</option>
+      <option value="grok-imagine-image-quality">grok-imagine-image-quality</option>
+      <option value="agnes-image-2.1-flash">agnes-image-2.1-flash</option>
     </select></div>
+    <p class="model-hint" id="modelHint"></p>
   </div>
 
   <div class="form-row">
@@ -98,6 +102,7 @@
     <div class="form-control"><select id="imageSizeSelect">
       <option value="1K">1K</option>
       <option value="2K">2K</option>
+      <option value="3K">3K</option>
       <option value="4K">4K</option>
     </select></div>
   </div>
@@ -116,6 +121,12 @@
       <option value="5:4">5:4</option>
       <option value="4:5">4:5</option>
       <option value="21:9">21:9</option>
+      <option value="2:1">2:1</option>
+      <option value="1:2">1:2</option>
+      <option value="19.5:9">19.5:9</option>
+      <option value="9:19.5">9:19.5</option>
+      <option value="20:9">20:9</option>
+      <option value="9:20">9:20</option>
     </select></div>
   </div>
 
@@ -125,6 +136,8 @@
       <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview</option>
       <option value="gemini-3-pro-image-preview">gemini-3-pro-image-preview</option>
       <option value="gpt-image-2">gpt-image-2</option>
+      <option value="grok-imagine-image-quality">grok-imagine-image-quality</option>
+      <option value="agnes-image-2.1-flash">agnes-image-2.1-flash</option>
     </select></div>
   </div>
 
@@ -132,6 +145,7 @@
     <label class="form-label">超分目标档位</label>
     <div class="form-control"><select id="upscaleImageSizeSelect">
       <option value="2K">2K</option>
+      <option value="3K">3K</option>
       <option value="4K">4K</option>
     </select></div>
   </div>
@@ -178,6 +192,20 @@
         </div></div>
       </div>
       <div class="form-row">
+        <label class="form-label">GROK KEY</label>
+        <div class="form-control"><div class="api-key-wrapper">
+          <input type="password" id="grokApiKeyInput" placeholder="请输入 Grok Images 租户 API Key">
+          <button class="toggle-eye" type="button" data-target="grokApiKeyInput" aria-label="显示或隐藏 Grok Images API Key">显示</button>
+        </div></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">AGNES KEY</label>
+        <div class="form-control"><div class="api-key-wrapper">
+          <input type="password" id="agnesApiKeyInput" placeholder="请输入 Agnes Image 租户 API Key">
+          <button class="toggle-eye" type="button" data-target="agnesApiKeyInput" aria-label="显示或隐藏 Agnes Image API Key">显示</button>
+        </div></div>
+      </div>
+      <div class="form-row">
         <label class="form-label">本地结果压缩上限</label>
         <div class="form-control"><input type="number" id="localResultMaxMbInput" min="1" max="50" step="0.5" inputmode="decimal" aria-describedby="localResultMaxMbHint"></div>
       </div>
@@ -210,6 +238,8 @@
       endpoint: document.getElementById('endpointInput'),
       gpt_api_key: document.getElementById('gptApiKeyInput'),
       gemini_api_key: document.getElementById('geminiApiKeyInput'),
+      grok_api_key: document.getElementById('grokApiKeyInput'),
+      agnes_api_key: document.getElementById('agnesApiKeyInput'),
       local_result_max_mb: document.getElementById('localResultMaxMbInput'),
       model: document.getElementById('modelSelect'),
       upscale_model: document.getElementById('upscaleModelSelect'),
@@ -229,6 +259,7 @@
     var upscaleRuleHint = document.getElementById('upscaleRuleHint')
     var checkPluginUpdate = document.getElementById('checkPluginUpdate')
     var updateResult = document.getElementById('updateResult')
+    var modelHint = document.getElementById('modelHint')
     var pendingPluginUpdate = null
 
     function setStatus(message, isError) {
@@ -302,6 +333,39 @@
       upscaleRuleHint.textContent = '当前规则：先生成 ' + source + ' 基础图，再由超分模型生成 ' + target + ' 最终图。'
     }
 
+    function setOptionEnabled(select, value, enabled) {
+      var option = Array.prototype.slice.call(select.options).find(function (item) { return item.value === value })
+      if (option) option.disabled = !enabled
+    }
+
+    function updateSizeCapabilities(select, model, defaultSize) {
+      var grok = model === 'grok-imagine-image-quality'
+      var agnes = model === 'agnes-image-2.1-flash'
+      setOptionEnabled(select, '3K', agnes)
+      setOptionEnabled(select, '4K', !grok)
+      if (grok && select.value !== '1K' && select.value !== '2K') select.value = defaultSize
+      if (!agnes && select.value === '3K') select.value = defaultSize
+    }
+
+    function updateModelCapabilities() {
+      var model = String(fields.model.value || '')
+      var upscaleModel = String(fields.upscale_model.value || '')
+      var constrainUpscale = currentGenerationMode === 'upscale'
+      var grok = model === 'grok-imagine-image-quality' || (constrainUpscale && upscaleModel === 'grok-imagine-image-quality')
+      var agnes = model === 'agnes-image-2.1-flash' || (constrainUpscale && upscaleModel === 'agnes-image-2.1-flash')
+      updateSizeCapabilities(fields.image_size, model, '2K')
+      updateSizeCapabilities(fields.upscale_image_size, upscaleModel, '2K')
+      Array.prototype.slice.call(fields.aspect_ratio.options).forEach(function (option) {
+        var value = option.value
+        option.disabled = (grok && !['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '2:1', '1:2', '19.5:9', '9:19.5', '20:9', '9:20'].includes(value)) ||
+          (agnes && !['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9'].includes(value))
+      })
+      if ((grok && !['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '2:1', '1:2', '19.5:9', '9:19.5', '20:9', '9:20'].includes(fields.aspect_ratio.value)) || (agnes && !['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '21:9'].includes(fields.aspect_ratio.value))) fields.aspect_ratio.value = agnes ? '1:1' : 'auto'
+      fields.quality.disabled = model === 'grok-imagine-image-quality'
+      modelHint.textContent = model === 'grok-imagine-image-quality' ? 'Grok 使用 1K/2K 和比例；不提交画质字段。' : (model === 'agnes-image-2.1-flash' ? 'Agnes 支持 1K/2K/3K/4K 和比例；参考图按其原生格式提交。' : '')
+      updateUpscaleRuleHint()
+    }
+
     function setGenerationMode(mode, persist) {
       currentGenerationMode = mode === 'upscale' ? 'upscale' : 'default'
       modeButtons.forEach(function (button) {
@@ -341,6 +405,7 @@
         else fields[key].value = value
       })
       setGenerationMode(params.generation_mode || defaults.generation_mode, false)
+      updateModelCapabilities()
       // Read old installations without displaying or saving the legacy field.
       if (!params.gpt_api_key && !params.gemini_api_key && params.api_key) {
         fields.gpt_api_key.value = params.api_key
@@ -362,11 +427,17 @@
     Object.keys(fields).forEach(function (key) {
       fields[key].addEventListener('change', function () {
         if (key === 'image_size' || key === 'upscale_image_size') updateUpscaleRuleHint()
+        if (key === 'model' || key === 'upscale_model') {
+          updateModelCapabilities()
+          save('image_size')
+          save('upscale_image_size')
+          save('aspect_ratio')
+        }
         save(key)
       })
     })
     modeButtons.forEach(function (button) {
-      button.addEventListener('click', function () { setGenerationMode(button.dataset.mode, true) })
+      button.addEventListener('click', function () { setGenerationMode(button.dataset.mode, true); updateModelCapabilities() })
     })
     document.getElementById('openSettings').addEventListener('click', function () {
       settingsPanel.hidden = false
