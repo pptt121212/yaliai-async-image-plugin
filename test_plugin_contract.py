@@ -173,7 +173,7 @@ class PluginContractTests(unittest.TestCase):
         result = plugin._install_plugin_update(
             "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
             "invalid",
-            "3.4.4",
+            "3.4.5",
         )
         self.assertFalse(result["ok"])
         self.assertIn("sha256", result["error"])
@@ -186,7 +186,7 @@ class PluginContractTests(unittest.TestCase):
             result = plugin._install_plugin_update(
                 "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
                 checksum,
-                "3.4.4",
+                "3.4.5",
             )
         finally:
             with plugin._generation_jobs_lock:
@@ -198,7 +198,7 @@ class PluginContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             package = Path(temp_dir) / "plugin.zip"
             with zipfile.ZipFile(package, "w") as archive:
-                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.4"\n')
+                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.5"\n')
                 archive.writestr("yaliai-async-image-plugin/ui/index.html", "<html></html>")
                 archive.writestr("yaliai-async-image-plugin/ui/task_log.html", "<html></html>")
             extract_dir = Path(temp_dir) / "extract"
@@ -221,14 +221,14 @@ class PluginContractTests(unittest.TestCase):
             root = Path(temp_dir)
             target = root / "yaliai-async-image-plugin"
             (target / "ui").mkdir(parents=True)
-            (target / "main.py").write_text('_PLUGIN_VERSION = "3.4.3"\nold = True\n', encoding="utf-8")
+            (target / "main.py").write_text('_PLUGIN_VERSION = "3.4.4"\nold = True\n', encoding="utf-8")
             (target / "ui" / "index.html").write_text("old index", encoding="utf-8")
             (target / "ui" / "task_log.html").write_text("old task log", encoding="utf-8")
             (target / "config.json").write_text('{"gpt_api_key":"local-only"}', encoding="utf-8")
 
             package = root / "update.zip"
             with zipfile.ZipFile(package, "w") as archive:
-                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.4"\nnew = True\n')
+                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.5"\nnew = True\n')
                 archive.writestr("yaliai-async-image-plugin/ui/index.html", "new index")
                 archive.writestr("yaliai-async-image-plugin/ui/task_log.html", "new task log")
                 archive.writestr("yaliai-async-image-plugin/README.md", "new readme")
@@ -242,21 +242,21 @@ class PluginContractTests(unittest.TestCase):
                     result = plugin._install_plugin_update(
                         "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
                         checksum,
-                        "3.4.4",
+                        "3.4.5",
                     )
             finally:
                 plugin.plugin_dir = original_plugin_dir
 
             self.assertTrue(result["ok"])
-            self.assertIn('_PLUGIN_VERSION = "3.4.4"', (target / "main.py").read_text(encoding="utf-8"))
+            self.assertIn('_PLUGIN_VERSION = "3.4.5"', (target / "main.py").read_text(encoding="utf-8"))
             self.assertEqual((target / "ui" / "index.html").read_text(encoding="utf-8"), "new index")
             self.assertEqual((target / "config.json").read_text(encoding="utf-8"), '{"gpt_api_key":"local-only"}')
             backup = Path(result["backup_path"])
-            self.assertEqual((backup / "main.py").read_text(encoding="utf-8"), '_PLUGIN_VERSION = "3.4.3"\nold = True\n')
+            self.assertEqual((backup / "main.py").read_text(encoding="utf-8"), '_PLUGIN_VERSION = "3.4.4"\nold = True\n')
 
     def test_update_check_reads_manifest_and_returns_signed_package_metadata(self):
         manifest = {
-            "version": "3.4.4",
+            "version": "3.4.5",
             "download_url": "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
             "sha256": hashlib.sha256(b"package").hexdigest(),
             "notes": "更新说明",
@@ -265,7 +265,7 @@ class PluginContractTests(unittest.TestCase):
             result = plugin._check_plugin_update()
         self.assertTrue(result["ok"])
         self.assertTrue(result["has_update"])
-        self.assertEqual(result["remote_version"], "3.4.4")
+        self.assertEqual(result["remote_version"], "3.4.5")
         self.assertEqual(result["notes"], "更新说明")
         self.assertEqual(request.call_args.args[0], plugin._UPDATE_MANIFEST_URL)
 
@@ -716,7 +716,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("size", body)
         self.assertEqual(outputs[0]["type"], "url")
 
-    def test_agnes_async_request_uses_openai_edit_path_and_extra_body_references(self):
+    def test_agnes_async_request_uses_generations_path_and_extra_body_references(self):
         session = _GatewaySession()
         with tempfile.TemporaryDirectory() as temp_dir, \
                 patch.object(plugin, "_sleep_with_cancel", side_effect=lambda *_: None), \
@@ -728,11 +728,12 @@ class PluginContractTests(unittest.TestCase):
                 {0: str(reference)}, "16:9", "3K", session=session, request_id="agnes-contract",
             )
         body = session.post_calls[0][1]["json"]
-        self.assertEqual(session.post_calls[0][0], "https://api.yaliai.com/v1/images/edits")
+        self.assertEqual(session.post_calls[0][0], "https://api.yaliai.com/v1/images/generations")
         self.assertEqual(body["model"], "agnes-image-2.1-flash")
         self.assertEqual(body["size"], "3K")
         self.assertEqual(body["ratio"], "16:9")
         self.assertNotIn("quality", body)
+        self.assertNotIn("image", body)
         self.assertTrue(body["extra_body"]["image"][0].startswith("data:image/png;base64,"))
         self.assertEqual(outputs[0]["type"], "url")
 

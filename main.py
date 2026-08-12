@@ -84,7 +84,7 @@ _GATEWAY_ENDPOINT = "https://api.yaliai.com"
 _HOST_TOOL_CALL_ENDPOINT = "http://127.0.0.1:8766/v1/tools/call"
 _HOST_TOOL_CALL_TIMEOUT_SECONDS = 12
 _OPENAI_IMAGE_OUTPUT_FORMAT = "jpeg"
-_PLUGIN_VERSION = "3.4.3"
+_PLUGIN_VERSION = "3.4.4"
 _UPDATE_MANIFEST_URL = "https://api.yaliai.com/downloads/yaliai-async-image-plugin-update.json"
 _UPDATE_ALLOWED_HOSTS = {"api.yaliai.com"}
 _UPDATE_MAX_PACKAGE_BYTES = 100 * 1024 * 1024
@@ -3944,18 +3944,20 @@ def _send_openai_compatible_async_request(
         else:
             image_values = list(url_refs)
 
-        if image_values:
-            url = f"{endpoint}/v1/images/edits"
-            payload = dict(common)
-            if model in AGNES_IMAGE_MODELS:
+        payload = dict(common)
+        if model in AGNES_IMAGE_MODELS:
+            # Agnes 2.1 has one native generations endpoint. References are
+            # carried in extra_body.image; they do not change the endpoint.
+            url = f"{endpoint}/v1/images/generations"
+            if image_values:
                 extra = dict(payload.get("extra_body") or {})
                 extra["image"] = image_values
                 payload["extra_body"] = extra
-            else:
-                payload["image"] = image_values[0] if len(image_values) == 1 else image_values
+        elif image_values:
+            url = f"{endpoint}/v1/images/edits"
+            payload["image"] = image_values[0] if len(image_values) == 1 else image_values
         else:
             url = f"{endpoint}/v1/images/generations"
-            payload = dict(common)
 
         accepted = _submit_async_request(
             session,
@@ -4015,7 +4017,7 @@ def send_agnes_image_request(
     async_poll_interval=5, async_max_wait=1800, progress=None, session=None,
     request_id=None, is_cancelled=lambda: False, task_metadata=None,
 ):
-    """Submit Agnes 2.1 through OpenAI Images paths with its K-tier contract."""
+    """Submit Agnes 2.1 through its generations endpoint and native fields."""
     del quality, download_timeout
     parameters = _native_image_parameters(model, image_size, aspect_ratio)
     common = {

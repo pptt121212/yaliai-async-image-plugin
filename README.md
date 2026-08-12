@@ -8,7 +8,7 @@
 
 - **异步生成与并发控制**：提交后立即保存任务 ID，批量任务并行执行，并根据本机带宽、内存和参考图处理压力限制活动任务数量。
 - **多协议模型适配**：自动区分 OpenAI Images、Gemini、Grok 与 Agnes 请求结构，并按各自接口规则转换尺寸、比例和参考图字段。
-- **Grok 与 Agnes 兼容接入**：支持 `grok-imagine-image-quality` 与 `agnes-image-2.1-flash`。二者仍通过 OpenAI Images 兼容路径提交异步任务，但分别使用 Grok 的 `resolution + aspect_ratio` 和 Agnes 的 `size + ratio + extra_body.image` 原生字段。
+- **Grok 与 Agnes 兼容接入**：支持 `grok-imagine-image-quality` 与 `agnes-image-2.1-flash`。Grok 使用 OpenAI Images 风格的 `generations/edits` 路径；Agnes 固定提交至其原生 `generations` 路径，并以 `size + ratio + extra_body.image` 表示参考图。
 - **参考图顺序稳定**：兼容字字动画的角色、场景、物品、分镜关联图和插件全局参考图；全局参考图始终追加在最后，不打乱宿主已有顺序。
 - **两阶段超分**：先生成基础图，再交给独立的超分模型生成最终图；支持继承原图比例、选择目标档位和自定义超分提示词。
 - **结果交付与压缩**：生成结果按宿主资源路径处理，超大参考图和结果图按比例压缩，尽量保持宿主继续引用所需的路径与格式。
@@ -108,7 +108,7 @@ API URL、各模型对应的 KEY 和本地图片压缩上限在独立设置弹�
    - `gpt-image-2` 使用 OpenAI Images 接口。
    - `gemini-3.1-flash-image-preview`、`gemini-3-pro-image-preview` 使用 Gemini 接口。
    - `grok-imagine-image-quality` 使用 OpenAI Images 兼容路径，支持 1K/2K 与 Grok 合法比例，不提交 `quality`。
-   - `agnes-image-2.1-flash` 使用 OpenAI Images 兼容路径，支持 1K/2K/3K/4K 与 Agnes 合法比例；参考图按 Agnes 原生字段提交。
+   - `agnes-image-2.1-flash` 固定使用 `/v1/images/generations`，支持 1K/2K/3K/4K 与 Agnes 合法比例；参考图按 `extra_body.image` 提交。
 5. 保存设置后即可从字字动画的图像生成入口调用。
 
 API Key 只保存在本机宿主用户资源目录，不写入项目源码。分发插件时不要把个人的 `config.json`、`async_tasks.jsonl` 或缓存目录一起打包。
@@ -125,7 +125,7 @@ https://api.yaliai.com/downloads/yaliai-async-image-plugin-update.json
 
 ```json
 {
-  "version": "3.4.3",
+  "version": "3.4.4",
   "download_url": "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
   "sha256": "完整 ZIP 文件的 SHA-256",
   "notes": "更新说明"
