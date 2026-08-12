@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-字字动画免费图像生成插件（自定义API版本）
+鸭梨AI图像生成插件（异步接口版）
 
 参数同步：
 - 在字字动画中运行时，配置和插件状态保存在 user_resources/plugins/
@@ -24,6 +24,7 @@ import json
 import threading
 import tempfile
 import uuid
+import zipfile
 import requests
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -83,6 +84,22 @@ _GATEWAY_ENDPOINT = "https://api.yaliai.com"
 _HOST_TOOL_CALL_ENDPOINT = "http://127.0.0.1:8766/v1/tools/call"
 _HOST_TOOL_CALL_TIMEOUT_SECONDS = 12
 _OPENAI_IMAGE_OUTPUT_FORMAT = "jpeg"
+_PLUGIN_VERSION = "3.4.1"
+_UPDATE_MANIFEST_URL = "https://api.yaliai.com/downloads/yaliai-async-image-plugin-update.json"
+_UPDATE_ALLOWED_HOSTS = {"api.yaliai.com"}
+_UPDATE_MAX_PACKAGE_BYTES = 100 * 1024 * 1024
+_UPDATE_MAX_ARCHIVE_FILES = 200
+_UPDATE_MAX_ARCHIVE_BYTES = 120 * 1024 * 1024
+_UPDATE_PRESERVED_PATHS = {
+    "config.json",
+    "async_tasks.jsonl",
+    "configured_references",
+    "task_thumbnails",
+    "__pycache__",
+}
+_update_install_lock = threading.Lock()
+_generation_jobs_lock = threading.Lock()
+_generation_jobs = set()
 _DEFAULT_UPSCALE_PROMPT = (
     "现在对这张图进行全景像素超分（Panorama Super-Resolution）与重绘。"
     "请将图像精细度和文字边缘细节提升至 {image_size} 电影级分辨率。"
@@ -268,6 +285,242 @@ def _save_single_param(key, value):
     return _save_config({key: value})
 
 
+# ===================== 插件更新 =====================
+
+def _parse_version(version):
+    """Parse only numeric dotted versions used by the published plugin package."""
+    text = str(version or "").strip()
+    if not re.fullmatch(r"\d+(?:\.\d+){0,3}", text):
+        raise ValueError(f"版本格式无效: {text or '空'}")
+    return tuple(int(part) for part in text.split("."))
+
+
+def _is_newer_version(remote_version, local_version=_PLUGIN_VERSION):
+    remote = list(_parse_version(remote_version))
+    local = list(_parse_version(local_version))
+    length = max(len(remote), len(local))
+    remote.extend([0] * (length - len(remote)))
+    local.extend([0] * (length - len(local)))
+    return tuple(remote) > tuple(local)
+
+
+def _is_allowed_update_url(value):
+    parsed = urlparse(str(value or "").strip())
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in _UPDATE_ALLOWED_HOSTS
+
+
+def _validate_update_sha256(value):
+    checksum = str(value or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise ValueError("更新清单缺少有效的 sha256")
+    return checksum
+
+
+def _compute_sha256(file_path):
+    """Return the SHA-256 checksum without loading the package into memory."""
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest().lower()
+
+
+def _extract_update_entry(manifest):
+    if not isinstance(manifest, dict):
+        raise ValueError("更新清单必须是 JSON 对象")
+
+    # Support both a compact single-plugin manifest and a shared manifest.
+    if isinstance(manifest.get("plugins"), list):
+        for item in manifest["plugins"]:
+            if isinstance(item, dict) and str(item.get("plugin_id", "")).strip() == plugin_dir.name:
+                return item
+        raise ValueError(f"更新清单中未找到插件: {plugin_dir.name}")
+    return manifest
+
+
+def _active_execution_summary():
+    with _generation_jobs_lock:
+        generation_count = len(_generation_jobs)
+    with _manual_upscale_jobs_lock:
+        manual_upscale_count = len(_manual_upscale_jobs)
+    gate_count = sum(
+        gate.snapshot()["active"] + gate.snapshot()["waiting"]
+        for gate in (_local_task_gate, _local_reference_gate, _local_delivery_gate, _local_reference_compression_gate)
+    )
+    return {
+        "generation_count": generation_count,
+        "manual_upscale_count": manual_upscale_count,
+        "gate_count": gate_count,
+        "busy": bool(generation_count or manual_upscale_count or gate_count),
+    }
+
+
+def _check_plugin_update():
+    try:
+        response = requests.get(
+            _UPDATE_MANIFEST_URL,
+            timeout=(5, 15),
+            headers={"Accept": "application/json", "User-Agent": f"YaliAI-Image-Plugin/{_PLUGIN_VERSION}"},
+        )
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+        remote = _extract_update_entry(response.json())
+        version = str(remote.get("version", "")).strip()
+        download_url = str(remote.get("download_url", "")).strip()
+        checksum = _validate_update_sha256(remote.get("sha256"))
+        if not _is_allowed_update_url(download_url):
+            raise ValueError("更新包地址必须是 api.yaliai.com 的 HTTPS 地址")
+        if not _is_newer_version(version):
+            return {
+                "ok": True,
+                "has_update": False,
+                "local_version": _PLUGIN_VERSION,
+                "remote_version": version,
+                "message": "当前已是最新版本",
+            }
+        return {
+            "ok": True,
+            "has_update": True,
+            "local_version": _PLUGIN_VERSION,
+            "remote_version": version,
+            "download_url": download_url,
+            "sha256": checksum,
+            "notes": str(remote.get("notes") or remote.get("changelog") or "无更新说明").strip(),
+        }
+    except Exception as error:
+        return {"ok": False, "error": f"检查更新失败: {error}"}
+
+
+def _safe_extract_update_package(package_path, extract_dir):
+    package_path = Path(package_path)
+    with zipfile.ZipFile(package_path, "r") as archive:
+        infos = archive.infolist()
+        if not infos or len(infos) > _UPDATE_MAX_ARCHIVE_FILES:
+            raise ValueError("更新包文件数量异常")
+        if sum(max(0, info.file_size) for info in infos) > _UPDATE_MAX_ARCHIVE_BYTES:
+            raise ValueError("更新包解压后体积超过限制")
+        for info in infos:
+            relative = Path(info.filename)
+            if not info.filename or relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("更新包包含非法路径")
+            # Unix symbolic-link marker. Windows junctions cannot be represented by zip extraction.
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError("更新包不允许包含链接文件")
+        archive.extractall(extract_dir)
+
+    roots = [path for path in Path(extract_dir).iterdir() if path.is_dir() and path.name == plugin_dir.name]
+    if len(roots) != 1:
+        raise ValueError(f"更新包必须包含唯一的 {plugin_dir.name}/ 根目录")
+    source_dir = roots[0]
+    required = (source_dir / "main.py", source_dir / "ui" / "index.html", source_dir / "ui" / "task_log.html")
+    if not all(path.is_file() for path in required):
+        raise ValueError("更新包缺少必要的插件文件")
+    return source_dir
+
+
+def _copy_update_tree(source_dir, target_dir, backup_dir):
+    """Replace distributable files while retaining mutable state and rolling back on failure."""
+    changed = []
+    try:
+        for source in sorted(Path(source_dir).rglob("*")):
+            relative = source.relative_to(source_dir)
+            if not relative.parts or relative.parts[0] in _UPDATE_PRESERVED_PATHS:
+                continue
+            if source.is_dir():
+                continue
+            target = Path(target_dir) / relative
+            backup = Path(backup_dir) / relative
+            existed = target.exists()
+            if existed:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staged = target.with_name(target.name + ".yaliai-update-new")
+            shutil.copy2(source, staged)
+            os.replace(staged, target)
+            changed.append((target, backup, existed))
+        return changed
+    except Exception:
+        for target, backup, existed in reversed(changed):
+            try:
+                if existed and backup.exists():
+                    shutil.copy2(backup, target)
+                elif target.exists():
+                    target.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _install_plugin_update(download_url, expected_sha256, remote_version):
+    if not _is_allowed_update_url(download_url):
+        return {"ok": False, "error": "更新包地址不受信任"}
+    try:
+        expected_sha256 = _validate_update_sha256(expected_sha256)
+        if not _is_newer_version(remote_version):
+            return {"ok": False, "error": "远端版本未高于当前版本"}
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+
+    if not _update_install_lock.acquire(blocking=False):
+        return {"ok": False, "error": "已有更新操作正在进行"}
+    try:
+        state = _active_execution_summary()
+        if state["busy"]:
+            return {"ok": False, "error": "存在正在执行的生成、下载或超分任务，请完成后再更新", "active": state}
+
+        with tempfile.TemporaryDirectory(prefix="yaliai-plugin-update-") as work_dir:
+            package_path = Path(work_dir) / "plugin-update.zip"
+            total = 0
+            with requests.get(
+                download_url,
+                timeout=(10, 120),
+                stream=True,
+                headers={"Accept": "application/zip", "User-Agent": f"YaliAI-Image-Plugin/{_PLUGIN_VERSION}"},
+            ) as response:
+                final_url = str(getattr(response, "url", download_url) or download_url)
+                if response.status_code != 200:
+                    raise ValueError(f"下载更新包失败: HTTP {response.status_code}")
+                if not _is_allowed_update_url(final_url):
+                    raise ValueError("更新包重定向到了不受信任的地址")
+                with open(package_path, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > _UPDATE_MAX_PACKAGE_BYTES:
+                            raise ValueError("更新包体积超过限制")
+                        handle.write(chunk)
+            actual_sha256 = _compute_sha256(package_path)
+            if actual_sha256 != expected_sha256:
+                raise ValueError("更新包 SHA-256 校验失败")
+
+            extract_dir = Path(work_dir) / "extract"
+            extract_dir.mkdir()
+            source_dir = _safe_extract_update_package(package_path, extract_dir)
+            main_text = (source_dir / "main.py").read_text(encoding="utf-8")
+            if f'_PLUGIN_VERSION = "{remote_version}"' not in main_text:
+                raise ValueError("更新包版本与远端清单不一致")
+
+            # Check again after the download, so a new generation cannot be overwritten mid-flight.
+            state = _active_execution_summary()
+            if state["busy"]:
+                return {"ok": False, "error": "下载期间出现执行任务，已取消安装", "active": state}
+
+            backup_dir = plugin_dir.parent / ".yaliai-update-backups" / time.strftime("%Y%m%d_%H%M%S")
+            backup_dir.mkdir(parents=True, exist_ok=False)
+            _copy_update_tree(source_dir, plugin_dir, backup_dir)
+            return {
+                "ok": True,
+                "message": f"已安装 {remote_version}，请重启字字动画后生效",
+                "backup_path": str(backup_dir),
+            }
+    except Exception as error:
+        return {"ok": False, "error": f"安装更新失败: {error}"}
+    finally:
+        _update_install_lock.release()
+
+
 # ===================== 默认参数 =====================
 
 _default_params = {
@@ -355,6 +608,10 @@ class _FifoGate:
         with self._condition:
             self._active = max(0, self._active - 1)
             self._condition.notify_all()
+
+    def snapshot(self):
+        with self._condition:
+            return {"active": self._active, "waiting": len(self._waiters), "limit": self._limit}
 
 
 # Keep a local workstation responsive when the host queues many frames. A
@@ -1318,9 +1575,9 @@ def get_params():
 
 def get_info():
     return {
-        "name": "字字动画免费图像生成插件（自定义API版本）",
+        "name": "鸭梨AI图像生成插件（异步接口版）",
         "description": "通过鸭梨 AI 网关异步生成图片，支持 Gemini 原生接口、OpenAI Images 文件上传和任务日志。",
-        "version": "3.3.0",
+        "version": _PLUGIN_VERSION,
         "author": "Yali AI",
     }
 
@@ -1401,6 +1658,16 @@ def handle_action(action, data=None, context=None):
             "path": str(_CONFIG_PATH),
             "exists": _CONFIG_PATH.exists(),
         }
+
+    elif action == "check_plugin_update":
+        return _check_plugin_update()
+
+    elif action == "install_plugin_update":
+        return _install_plugin_update(
+            data.get("download_url", ""),
+            data.get("sha256", ""),
+            str(data.get("remote_version", "") or "").strip(),
+        )
 
     elif action == "get_task_logs":
         page = max(1, _safe_int(data.get("page", 1), 1))
@@ -3708,7 +3975,7 @@ def _legacy_generate(context):
 
 # ===================== 鸭梨 AI 异步生成入口 =====================
 
-def generate(context):
+def _generate_impl(context):
     """Generate one host task, or a host-provided batch, in deterministic order.
 
     Batch items are submitted and polled concurrently. Each worker owns its
@@ -3798,7 +4065,7 @@ def generate(context):
                 pass
 
     print("\n" + "=" * 60)
-    print("字字动画免费图像生成插件开始异步任务")
+    print("鸭梨AI图像生成插件开始异步任务")
     print("=" * 60)
     print(f"模型: {model}; 比例: {aspect_ratio}; 档位: {image_size}; 画质: {quality}; 批次: {batch_num}")
     if generation_mode == "upscale":
@@ -4098,6 +4365,18 @@ def generate(context):
         raise Exception(f"PLUGIN_ERROR:::{exc}") from exc
     finally:
         cleanup_reference_images()
+
+
+def generate(context):
+    """Track the complete host call so plugin updates cannot replace active code."""
+    job_id = uuid.uuid4().hex
+    with _generation_jobs_lock:
+        _generation_jobs.add(job_id)
+    try:
+        return _generate_impl(context)
+    finally:
+        with _generation_jobs_lock:
+            _generation_jobs.discard(job_id)
 
 
 # ===================== 初始化 =====================

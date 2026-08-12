@@ -1,9 +1,12 @@
 import base64
+import hashlib
 import importlib.util
+import json
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -77,6 +80,23 @@ class _DownloadResponse:
         yield base64.b64decode(PNG_1X1)
 
 
+class _UpdateDownloadResponse:
+    def __init__(self, payload, url="https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip"):
+        self.status_code = 200
+        self.url = url
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def iter_content(self, chunk_size):
+        for offset in range(0, len(self._payload), chunk_size):
+            yield self._payload[offset:offset + chunk_size]
+
+
 class _DownloadSession:
     def __init__(self):
         self.get_calls = []
@@ -113,8 +133,13 @@ class PluginContractTests(unittest.TestCase):
             "save_configured_references",
             "clear_configured_references",
             "open_task_logs",
+            "check_plugin_update",
+            "install_plugin_update",
         ):
             self.assertIn(f"PluginSDK.onAction('{action}'", ui_html)
+        self.assertIn('id="checkPluginUpdate"', ui_html)
+        self.assertIn("PluginSDK.sendAction('check_plugin_update'", ui_html)
+        self.assertIn("PluginSDK.sendAction('install_plugin_update'", ui_html)
 
     def test_handle_action_accepts_host_context_argument(self):
         original_params = dict(plugin._global_params)
@@ -125,6 +150,124 @@ class PluginContractTests(unittest.TestCase):
         finally:
             plugin._global_params.clear()
             plugin._global_params.update(original_params)
+
+    def test_plugin_update_requires_a_strictly_newer_numeric_version(self):
+        self.assertTrue(plugin._is_newer_version("3.4.2", "3.4.1"))
+        self.assertFalse(plugin._is_newer_version("3.4.1", "3.4.1"))
+        self.assertFalse(plugin._is_newer_version("3.4.0", "3.4.1"))
+        with self.assertRaises(ValueError):
+            plugin._is_newer_version("latest", "3.4.1")
+
+    def test_plugin_update_requires_trusted_https_download_host(self):
+        self.assertTrue(plugin._is_allowed_update_url(
+            "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip"
+        ))
+        self.assertFalse(plugin._is_allowed_update_url(
+            "http://api.yaliai.com/downloads/yaliai-async-image-plugin.zip"
+        ))
+        self.assertFalse(plugin._is_allowed_update_url(
+            "https://example.com/yaliai-async-image-plugin.zip"
+        ))
+
+    def test_plugin_update_rejects_bad_checksum_before_download(self):
+        result = plugin._install_plugin_update(
+            "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
+            "invalid",
+            "3.4.2",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("sha256", result["error"])
+
+    def test_plugin_update_rejects_install_while_generation_is_active(self):
+        checksum = "0" * 64
+        with plugin._generation_jobs_lock:
+            plugin._generation_jobs.add("test-active-job")
+        try:
+            result = plugin._install_plugin_update(
+                "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
+                checksum,
+                "3.4.2",
+            )
+        finally:
+            with plugin._generation_jobs_lock:
+                plugin._generation_jobs.discard("test-active-job")
+        self.assertFalse(result["ok"])
+        self.assertIn("正在执行", result["error"])
+
+    def test_plugin_update_accepts_only_safe_complete_package_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package = Path(temp_dir) / "plugin.zip"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.2"\n')
+                archive.writestr("yaliai-async-image-plugin/ui/index.html", "<html></html>")
+                archive.writestr("yaliai-async-image-plugin/ui/task_log.html", "<html></html>")
+            extract_dir = Path(temp_dir) / "extract"
+            extract_dir.mkdir()
+            source = plugin._safe_extract_update_package(package, extract_dir)
+            self.assertEqual(source.name, "yaliai-async-image-plugin")
+
+    def test_plugin_update_rejects_path_traversal_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package = Path(temp_dir) / "unsafe.zip"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("../main.py", "unsafe")
+            extract_dir = Path(temp_dir) / "extract"
+            extract_dir.mkdir()
+            with self.assertRaisesRegex(ValueError, "非法路径"):
+                plugin._safe_extract_update_package(package, extract_dir)
+
+    def test_plugin_update_installs_verified_package_and_preserves_user_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "yaliai-async-image-plugin"
+            (target / "ui").mkdir(parents=True)
+            (target / "main.py").write_text('_PLUGIN_VERSION = "3.4.1"\nold = True\n', encoding="utf-8")
+            (target / "ui" / "index.html").write_text("old index", encoding="utf-8")
+            (target / "ui" / "task_log.html").write_text("old task log", encoding="utf-8")
+            (target / "config.json").write_text('{"gpt_api_key":"local-only"}', encoding="utf-8")
+
+            package = root / "update.zip"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("yaliai-async-image-plugin/main.py", '_PLUGIN_VERSION = "3.4.2"\nnew = True\n')
+                archive.writestr("yaliai-async-image-plugin/ui/index.html", "new index")
+                archive.writestr("yaliai-async-image-plugin/ui/task_log.html", "new task log")
+                archive.writestr("yaliai-async-image-plugin/README.md", "new readme")
+            package_bytes = package.read_bytes()
+            checksum = hashlib.sha256(package_bytes).hexdigest()
+
+            original_plugin_dir = plugin.plugin_dir
+            try:
+                plugin.plugin_dir = target
+                with patch.object(plugin.requests, "get", return_value=_UpdateDownloadResponse(package_bytes)):
+                    result = plugin._install_plugin_update(
+                        "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
+                        checksum,
+                        "3.4.2",
+                    )
+            finally:
+                plugin.plugin_dir = original_plugin_dir
+
+            self.assertTrue(result["ok"])
+            self.assertIn('_PLUGIN_VERSION = "3.4.2"', (target / "main.py").read_text(encoding="utf-8"))
+            self.assertEqual((target / "ui" / "index.html").read_text(encoding="utf-8"), "new index")
+            self.assertEqual((target / "config.json").read_text(encoding="utf-8"), '{"gpt_api_key":"local-only"}')
+            backup = Path(result["backup_path"])
+            self.assertEqual((backup / "main.py").read_text(encoding="utf-8"), '_PLUGIN_VERSION = "3.4.1"\nold = True\n')
+
+    def test_update_check_reads_manifest_and_returns_signed_package_metadata(self):
+        manifest = {
+            "version": "3.4.2",
+            "download_url": "https://api.yaliai.com/downloads/yaliai-async-image-plugin.zip",
+            "sha256": hashlib.sha256(b"package").hexdigest(),
+            "notes": "更新说明",
+        }
+        with patch.object(plugin.requests, "get", return_value=_Response(200, manifest)) as request:
+            result = plugin._check_plugin_update()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["has_update"])
+        self.assertEqual(result["remote_version"], "3.4.2")
+        self.assertEqual(result["notes"], "更新说明")
+        self.assertEqual(request.call_args.args[0], plugin._UPDATE_MANIFEST_URL)
 
     def test_manual_upscale_refreshes_the_host_selected_asset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
