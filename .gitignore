@@ -3,3 +3,4 @@ __pycache__/
 config.json
 async_tasks.jsonl
 task_thumbnails/
+docs/ui-settings-*.png

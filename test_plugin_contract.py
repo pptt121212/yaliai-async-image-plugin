@@ -1135,6 +1135,8 @@ class PluginContractTests(unittest.TestCase):
         ui_html = (PLUGIN_PATH.parent / "ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn('<label class="form-label">API URL</label>', ui_html)
         self.assertIn('id="settingsPanel"', ui_html)
+        self.assertIn('max-height: calc(100dvh - 24px)', ui_html)
+        self.assertIn('position: sticky', ui_html)
         self.assertIn('id="openSettings"', ui_html)
         self.assertIn('id="endpointInput"', ui_html)
         self.assertIn('.settings-backdrop[hidden] { display: none; }', ui_html)
